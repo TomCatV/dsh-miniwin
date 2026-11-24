@@ -688,6 +688,8 @@ async function stopSession () {
   try { if (s.server) await s.server.kill() } catch {}
   try { if (s.adb) await s.adb.run(['reverse', '--remove-all']) } catch {}
   try { if (s.adb && s.port) await s.adb.removeForward(s.port) } catch {}
+  // 音频路由：断开时停音频 + 杀掉手机端 APK（用户要求）
+  try { if (s.router) await s.router.teardown() } catch {}
   pushStatus({ streaming: false })
   logLine('info', '会话已停止')
 }
@@ -1466,6 +1468,37 @@ async function startScrcpySession (opts = {}) {
   logLine('ok', '投屏已启动（scrcpy 采集）')
 
   /**
+   * ── 音频路由（按用户规则）──────────────────────────────
+   *   · 手机插耳机（有线/蓝牙）→ 声音留在手机，绝不投到电脑
+   *   · 手机外放 → 连接即双端静音（手机媒体音量降到 0、投屏音量 0）
+   *   · 手动把投屏音量调上去 → 才开始转发手机声音
+   *   · 投屏音量不影响手机；手机音量变化 → 投屏音量同步成手机音量
+   *   · 断开连接 → 停音频 + 杀掉手机端 APK
+   */
+  try {
+    const { AudioRouter } = require('./audio-router.js')
+    const router = new AudioRouter({
+      adb: adbPath(),
+      serial: dev.serial,
+      apkPackage: 'com.miniwin.stream',
+      onLog: (m) => logLine('info', m),
+      onState: (st) => { try { win && win.webContents.send('audio:state', st) } catch {} }
+    })
+    session.router = router
+    await router.poll()
+    if (router.last.headset) {
+      logLine('info', `[audio] 耳机已连接（${router.last.devices.join('+')}）：声音留在手机端`)
+    } else {
+      await router.mutePhone()
+      router.setPcVolume(0)
+      logLine('info', '[audio] 外放：已双端静音，调高投屏音量才会开始转发')
+    }
+    router.start()
+  } catch (e) {
+    logLine('warn', '[audio] 路由初始化失败: ' + e.message)
+  }
+
+  /**
    * ══════════ 音频：走 APK，不走 scrcpy ══════════
    *
    * 这台机器是 Android 12，scrcpy 的音频捕获要 Android 13+
@@ -1873,7 +1906,17 @@ if (!gotTheLock) {
      */
     if (!win || win.isDestroyed()) {
       logLine('info', '收到重开请求，正在重建迷你窗…')
-      createWindow().catch(e => logLine('error', '重建窗口失败: ' + e.message))
+      /**
+       * 必须调 bootWindow —— 它才是真正的建窗函数（whenReady 与托盘用的都是它）。
+       *
+       * 原来写的是 createWindow，而这个函数**在文件里根本不存在**。
+       * 后果：窗口被关掉之后，用户从侧边栏再点一次「启动迷你窗」，
+       * 已有实例收到 second-instance 立刻抛
+       *   ReferenceError: createWindow is not defined
+       * 主进程弹出「A JavaScript error occurred in the main process」，
+       * 窗口也再也回不来。
+       */
+      bootWindow().catch(e => logLine('error', '重建窗口失败: ' + e.message))
       return
     }
     if (win.isMinimized()) win.restore()
@@ -1935,8 +1978,21 @@ ipcMain.handle('dev:connect-wifi', async (_e, { host, port }) => {
   } catch (e) { return { ok: false, error: e.message } }
 })
 
-ipcMain.handle('dev:tcpip', async () => {
-  const adb = new Adb(adbPath())
+ipcMain.handle('audio:set-volume', async (_e, v) => {
+  if (!session || !session.router) return { ok: false, error: '没有活动会话' }
+  try {
+    const r = session.router.setPcVolume(Number(v) || 0)
+    logLine('info', `[audio] 投屏音量=${r.pcVolume}，${r.forwarding ? '转发中' : '不转发'}`)
+    return { ok: true, ...r }
+  } catch (e) { return { ok: false, error: e.message } }
+})
+
+ipcMain.handle('audio:state', async () => {
+  if (!session || !session.router) return { ok: false, error: '没有活动会话' }
+  return { ok: true, ...session.router.last, forwarding: session.router.shouldForward() }
+})
+
+ipcMain.handle('dev:tcpip', async () => {  const adb = new Adb(adbPath())
   try {
     await adb.pickDevice()
     const r = await adb.enableTcpip(5555)

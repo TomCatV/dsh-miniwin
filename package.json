@@ -1,6 +1,6 @@
 {
   "name": "dsh-miniwin",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Phone screen mirroring in the DSH sidebar: scan a QR code to pair, then the phone screen opens in a transparent desktop mini-window. Ships its own scrcpy runtime; content and background opacity are adjustable independently.",
   "type": "module",
   "main": "lib/index.js",
