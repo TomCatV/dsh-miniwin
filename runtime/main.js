@@ -1475,23 +1475,56 @@ async function startScrcpySession (opts = {}) {
    *   · 投屏音量不影响手机；手机音量变化 → 投屏音量同步成手机音量
    *   · 断开连接 → 停音频 + 杀掉手机端 APK
    */
+  /** 耳机态：APK 已被停掉（声音留在手机端）。放在 try 外面，后面的自愈要用 */
+  let apkSuppressed = false
   try {
     const { AudioRouter } = require('./audio-router.js')
+
+    /**
+     * 耳机态：APK 必须停掉。
+     *
+     * 不只是「把投屏音量压到 0」—— 那个 APK 一旦跑起来就会把手机
+     * STREAM_MUSIC 锁在 0，耳机里也会跟着没声。所以耳机在场时
+     * 直接 force-stop 它，让手机按自己的方式出声；
+     * 耳机拔掉再把自愈拉起来，重新接管。
+     */
+    const applyAudioRoute = (st) => {
+      if (!session || !st) return
+      if (st.headset && !apkSuppressed) {
+        apkSuppressed = true
+        try { if (session.healer) session.healer.stop() } catch {}
+        router.killApk()
+          .then(() => logLine('ok', '[audio] 耳机已连接：已停掉手机端采集，声音留在手机'))
+          .catch(() => {})
+      } else if (!st.headset && apkSuppressed) {
+        apkSuppressed = false
+        logLine('info', '[audio] 耳机已拔出：恢复手机端声音采集')
+        try { if (session.healer) session.healer.start() } catch {}
+      }
+    }
+
     const router = new AudioRouter({
       adb: adbPath(),
       serial: dev.serial,
       apkPackage: 'com.miniwin.stream',
+      httpPort: 27191,
       onLog: (m) => logLine('info', m),
-      onState: (st) => { try { win && win.webContents.send('audio:state', st) } catch {} }
+      onState: (st) => {
+        try { win && win.webContents.send('audio:state', st) } catch {}
+        applyAudioRoute(st)
+      }
     })
     session.router = router
+
     await router.poll()
     if (router.last.headset) {
       logLine('info', `[audio] 耳机已连接（${router.last.devices.join('+')}）：声音留在手机端`)
+      apkSuppressed = true
+      await router.killApk()
     } else {
-      await router.mutePhone()
+      // 外放：投屏音量默认 0。手机那头由 APK 自己静音，不用在这里灌音量键。
       router.setPcVolume(0)
-      logLine('info', '[audio] 外放：已双端静音，调高投屏音量才会开始转发')
+      logLine('info', '[audio] 外放：投屏音量默认 0，调高才开始把手机声音投到电脑')
     }
     router.start()
   } catch (e) {
@@ -1563,6 +1596,14 @@ async function startScrcpySession (opts = {}) {
         })
         healer.start()
         session.healer = healer
+        /**
+         * 耳机在场时不要把自愈拉起来 —— 它会立刻把 APK 重新推上去，
+         * 而那个 APK 一跑就把手机音量锁 0，耳机里照样没声。
+         */
+        if (apkSuppressed) {
+          try { healer.stop() } catch {}
+          logLine('info', '[audio] 耳机仍连接中：暂不拉起手机端采集')
+        }
       } else {
         logLine('warn', '音频接收端启动失败: ' + (ar.error || ''))
       }

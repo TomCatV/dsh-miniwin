@@ -133,6 +133,9 @@
     border-color:rgba(255,255,255,.28);color:#fff;
     box-shadow:0 2px 10px rgba(47,124,246,.42);
   }
+  /* 耳机态：音量按钮染蓝，表示「声音留在手机端」 */
+  #btnVol.headset{color:#a9ccff;border-color:rgba(122,176,255,.45);background:rgba(74,144,248,.20)}
+
   .ico svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.9;
     stroke-linecap:round;stroke-linejoin:round;display:block}
   /* 关闭：平时低调，hover 才泛起红 —— 破坏性操作不该和常用按钮抢注意力 */
@@ -2262,47 +2265,73 @@ function paintVol (v) {
   $('volVal').textContent = Math.round(v * 100) + '%'
 }
 
+/**
+ * 音量的单一入口。
+ *
+ * 两路音频都要受这个滑块控制，所以不能只改 wifiAudio：
+ *   · wifiAudio  —— 网络推流那一路的增益
+ *   · AUDIO.gain —— 解码器那一路（WebAudio GainNode）的增益
+ *     （之前固定 1，等于滑块对 APK 那路完全无效）
+ *
+ * 规则由主进程 AudioRouter 决定：耳机不转发、外放默认双端静音、
+ * 手机音量变化 → 投屏音量跟着重置。渲染层只做两件事：
+ *   1. 用户拖滑块 → 画出来 + 把意图报给主进程（0..15）
+ *   2. 主进程推 audio:state → 把权威值画回滑块
+ */
+function applyVolume (v) {
+  v = Math.max(0, Math.min(1, v))
+  paintVol(v)
+  /**
+   * wifiAudio 是后面才 `let` 出来的，而 applyVolume 在模块末尾会被立刻
+   * 调一次（启动默认静音）。直接引用会撞 TDZ：
+   *   Cannot access 'wifiAudio' before initialization
+   * try 包一层，初始化前拿到 null，初始化之后自然就对上了。
+   */
+  try { if (wifiAudio) wifiAudio.setVolume(v) } catch {}
+  try { if (typeof AUDIO !== 'undefined' && AUDIO && AUDIO.gain) AUDIO.gain.gain.value = v } catch {}
+}
+
 function setVolFromEvent (e) {
   const r = volTrack.getBoundingClientRect()
   // 从底部往上：y 越大音量越小
   let v = 1 - (e.clientY - r.top) / r.height
   v = Math.max(0, Math.min(1, v))
-  applyVolume(v, 'local')
+  applyVolume(v)
+  try { window.api.setAudioVolume(Math.round(v * 15)) } catch {}
 }
 
 /**
- * 音量的单一入口。
+ * 主进程推来的权威音频状态。
  *
- * source='local'：用户拖滑块 → 只改本地
- * source='phone'：手机音量键 → 同步滑块显示（gain 已由手机侧静音语义接管）
+ *   headset  → 耳机插着：滑块在哪都必须是 0（声音留在手机端）
+ *   pcVolume → 0..15，外放时的投屏音量
  *
- * 手机音量键现在是电脑音量的遥控器：手机端 ContentObserver 捕获
- * 音量变化 → 1 字节消息 → /meta 的 phoneVolume → 这里同步。
- * 两个来源最终都落在 wifiAudio.setVolume 上，谁后到谁生效。
+ * 这里**不再**轮询 /meta 的 phoneVolume —— 手机音量已经由 AudioRouter
+ * 统一处理（读的是 dumpsys 的 streamVolume，比 APK 那条 1 字节消息更准），
+ * 两处同时写会互相打架。
  */
-let lastPhoneVol = -1
-function applyVolume (v, source) {
-  v = Math.max(0, Math.min(1, v))
-  paintVol(v)
-  if (wifiAudio) wifiAudio.setVolume(v)
-  if (source === 'local') {
-    try { localStorage.setItem('mw:vol', String(v)) } catch {}
+function paintAudioState (st) {
+  if (!st) return
+  const hs = !!st.headset
+  const bv = $('btnVol')
+  if (bv) bv.title = hs ? '耳机已连接：声音留在手机端' : '音量'
+  if (hs) {
+    applyVolume(0)
+    if (bv) bv.classList.add('headset')
+    return
   }
+  if (bv) bv.classList.remove('headset')
+  const v = Math.max(0, Math.min(15, Number(st.pcVolume) || 0))
+  applyVolume(v / 15)
 }
 
-// 轮询手机音量（音量键按下时手机会推 1 字节消息到接收端）
-setInterval(() => {
-  fetch('http://127.0.0.1:43111/meta', { cache: 'no-store' })
-    .then(r => r.json())
-    .then(j => {
-      if (!j || !j.ok || typeof j.phoneVolume !== 'number') return
-      if (j.phoneVolume === lastPhoneVol) return
-      lastPhoneVol = j.phoneVolume
-      // 只同步显示和 gain，不写回手机
-      applyVolume(j.phoneVolume / 255, 'phone')
-    })
-    .catch(() => {})
-}, 1500)
+if (window.api.onAudioState) window.api.onAudioState(paintAudioState)
+if (window.api.getAudioState) {
+  window.api.getAudioState().then(r => { if (r && r.ok) paintAudioState(r) }).catch(() => {})
+}
+
+/* 启动默认静音 —— 外放连上投屏，投屏音量就是 0 */
+applyVolume(0)
 
 volTrack.addEventListener('pointerdown', e => {
   e.preventDefault()
@@ -2339,11 +2368,8 @@ document.addEventListener('pointerdown', e => {
   $('btnVol').classList.remove('on')
 })
 
-// 还原上次音量
-try {
-  const saved = parseFloat(localStorage.getItem('mw:vol') || '1')
-  paintVol(Number.isFinite(saved) ? saved : 1)
-} catch { paintVol(1) }
+// 投屏音量不持久化：规则是「连上投屏默认静音」，恢复上次的大音量会把这条规则废掉
+paintVol(0)
 // 点面板外部关闭（面板自身与顶部齿轮除外）
 document.addEventListener('pointerdown', e => {
   if (!panelOpen) return
@@ -2994,11 +3020,8 @@ window.api.onWifiStart(({ source }) => {
         return
       }
 
-      // 应用用户上次设置的音量
-      try {
-        const saved = parseFloat(localStorage.getItem('mw:vol') || '1')
-        audio.setVolume(Number.isFinite(saved) ? saved : 1)
-      } catch {}
+      // 新起的音频链一律从 0 开始（之后的值由主进程 AudioRouter 决定）
+      try { audio.setVolume(0) } catch {}
 
       wifiAudio = audio
       addLocalLog('ok', '音频已开启')

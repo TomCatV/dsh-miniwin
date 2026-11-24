@@ -78,6 +78,22 @@ contextBridge.exposeInMainWorld('api', {
   onAudioFrame: (cb) => ipcRenderer.on('audio:frame', (_e, d) => cb(d)),
 
   /**
+   * 音频路由（手机端的声音到底去哪）。
+   *
+   * 规则由主进程的 AudioRouter 持有：
+   *   · 耳机插着        → 永不转发，声音留在手机
+   *   · 外放            → 连接即双端静音，投屏音量默认 0
+   *   · 手动调高投屏音量 → 才开始转发
+   *   · 投屏音量不影响手机；手机音量变化 → 投屏音量跟着重置
+   *
+   * 渲染层只做两件事：把用户拖滑块的结果报上去（0..15），
+   * 以及把主进程算出来的权威状态画到滑块上。
+   */
+  setAudioVolume: (v) => ipcRenderer.invoke('audio:set-volume', v),
+  getAudioState: () => ipcRenderer.invoke('audio:state'),
+  onAudioState: (cb) => ipcRenderer.on('audio:state', (_e, d) => cb(d)),
+
+  /**
    * 置顶状态变更通知。
    *
    * 主进程有两个地方会改置顶：快捷键 Ctrl+Shift+F12、托盘/更多菜单。

@@ -53,6 +53,8 @@ class ScrcpyCapture {
     this.maxSize = o.maxSize || 720
     this.bitRate = o.bitRate || '8M'
     this.maxFps = o.maxFps || 30
+    /** 是否把手机音频一起采集到电脑（默认关：耳机时声音留在手机端） */
+    this.audio = !!o.audio
     /**
      * adb.exe 路径 —— 用来清理手机侧的 scrcpy-server。
      *
@@ -240,6 +242,8 @@ class ScrcpyCapture {
          * 窗口纯属多余。
          */
         '--no-window',
+        // 音频永远不走 scrcpy：这台是 Android 12，scrcpy 的播放音频捕获
+        // 需要 Android 13+。声音要投到电脑时走 APK 的 AudioPlaybackCapture。
         '--no-audio',
         '--record', this.pipeName,
         '--record-format', 'mkv',
