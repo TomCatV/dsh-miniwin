@@ -1,0 +1,3143 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>MiniWin Stream</title>
+<style>
+  :root{
+    --content-op:1; --bg-op:1; --bg-blur:16px; --radius:14px; --hz:11px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;-webkit-user-select:none;user-select:none}
+  html,body{
+    width:100%;height:100%;overflow:hidden;background:transparent;
+    font:13px/1.5 "Segoe UI","Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;
+    color:#e9ebf2;-webkit-font-smoothing:antialiased;
+  }
+
+  /**
+   * 性能说明（实测 60fps 视频下掉帧明显）：
+   *
+   * 原来 #shell 上有 backdrop-filter: blur(16px)。
+   * 它要对「窗口背后的桌面」做实时模糊，而窗口里每帧都在播 60fps 视频
+   * → 每一帧都触发一次全窗口模糊 → GPU 直接顶满，画面卡。
+   *
+   * 现在：默认不做背景模糊，只保留半透明底色（背景透明度滑杆照样有效）。
+   * 需要毛玻璃感时给 #shell 加 .blur 类，且模糊半径降到 10px。
+   * box-shadow 也从 60px 收到 28px（大范围阴影每次重绘都要算）。
+   */
+  #shell{
+    position:absolute;inset:0;border-radius:var(--radius);overflow:hidden;
+    background:rgba(11,14,20,var(--bg-op));
+    border:1px solid rgba(255,255,255,.14);
+    box-shadow:0 10px 28px rgba(0,0,0,.42);
+    will-change:auto;
+  }
+  #shell.blur{
+    -webkit-backdrop-filter:blur(10px);
+    backdrop-filter:blur(10px);
+  }
+
+  #content{position:absolute;inset:0;display:flex;flex-direction:column}
+
+  /* ==========================================================================
+     顶部工具栏（可拖动）
+     --------------------------------------------------------------------------
+     重构目标：从「一排等权按钮」改成有主次的三段式工具条。
+
+     旧结构的问题（411px 宽的窗口里同时塞了 7 个同尺寸按钮 + 标题 + 帧率）：
+       · 没有视觉层次 —— 返回和关闭长得一样重，用户每次都要找
+       · 标题被压成「HBN ...」，占位置却没信息
+       · 画质胶囊做得像静态标签，看着不像能点
+       · 所有按钮贴着排，密集恐惧，误触率高
+
+     新结构（左 → 右）：
+       [状态胶囊] [帧率]  ←左手边：只读信息
+                    ↕ 弹性留白（这一整段都是拖动区）
+       [清晰度 ▾] │ [⟨ ⌂] │ [⏸ 🔊] [⋯] [✕]   ←右手边：操作
+
+     分组之间用 1px 竖线隔开，视觉上从「七个按钮」变成「三组工具」。
+     ========================================================================== */
+  #bar{
+    height:46px;flex:0 0 auto;display:flex;align-items:center;gap:3px;
+    padding:0 8px;cursor:grab;overflow:hidden;
+    /* 整条 bar 都是拖动热区，任何情况下都不该出现文字选择高亮 */
+    user-select:none;
+    background:linear-gradient(180deg,rgba(29,34,46,.97),rgba(16,19,26,.95));
+    border-bottom:1px solid rgba(255,255,255,.07);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.05),0 8px 20px -14px rgba(0,0,0,.95);
+    /* 必须高于 .rz-n（50），否则顶部缩放把手会盖住整条拖动区 */
+    position:relative;z-index:65;
+  }
+  #bar:active{cursor:grabbing}
+  /* 拖动进行中：按钮不做 hover 反馈，避免「按住图标拖窗口」时按钮一闪一闪 */
+  body.bar-dragging{cursor:grabbing}
+  body.bar-dragging #bar,body.bar-dragging .ico,body.bar-dragging .qbtn{cursor:grabbing}
+
+  /* 弹性留白：既撑开左右分区，又是最舒服的拖动热区 */
+  .bgrow{flex:1 1 auto;min-width:4px;align-self:stretch}
+
+  /* 分组竖线分隔 */
+  .sep{
+    flex:0 0 auto;width:1px;height:16px;border-radius:1px;
+    background:rgba(255,255,255,.10);margin:0 1px;
+  }
+
+  /* ---------- 状态胶囊（左） ---------- */
+  .statuspill{
+    flex:0 0 auto;min-width:0;display:flex;align-items:center;gap:6px;
+    height:24px;padding:0 8px 0 6px;border-radius:12px;
+    background:rgba(255,255,255,.055);
+    border:1px solid rgba(255,255,255,.085);
+    transition:background .15s,border-color .15s;
+  }
+  .statuspill:hover{background:rgba(255,255,255,.10);border-color:rgba(255,255,255,.16)}
+  #dot{
+    width:8px;height:8px;border-radius:50%;background:#4a5060;flex:0 0 auto;
+    transition:background .25s,box-shadow .25s;
+  }
+  #dot.live{background:#3ddc84;box-shadow:0 0 10px rgba(61,220,132,.7)}
+  #dot.err{background:#ff5d55;box-shadow:0 0 10px rgba(255,93,85,.6)}
+  #dot.wait{background:#f0b429;box-shadow:0 0 10px rgba(240,180,41,.6);
+    animation:mw-pulse 1.4s ease-in-out infinite}
+  @keyframes mw-pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  #title{
+    font-size:11.5px;font-weight:620;letter-spacing:.005em;
+    color:rgba(233,235,242,.92);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+    max-width:104px;
+  }
+  #meta{
+    font-size:9.5px;font-weight:600;color:rgba(233,235,242,.46);
+    font-variant-numeric:tabular-nums;
+    font-family:Consolas,"Cascadia Mono",monospace;white-space:nowrap;flex:0 0 auto;
+    padding:3px 7px;border-radius:7px;background:rgba(255,255,255,.05);
+    border:1px solid rgba(255,255,255,.07);
+  }
+
+  /* ---------- 图标按钮 ---------- */
+  .ico{
+    width:24px;height:24px;border-radius:9px;display:grid;place-items:center;flex:0 0 auto;
+    background:transparent;border:1px solid transparent;
+    color:rgba(233,235,242,.72);
+    cursor:pointer;
+    transition:background .14s,border-color .14s,color .14s,transform .08s;
+  }
+  .ico:hover{background:rgba(255,255,255,.10);border-color:rgba(255,255,255,.10);color:#fff}
+  /* 导航键（返回/桌面）：按下时立刻给反馈 ——
+     这两个是「点了就希望手机马上响应」的操作，
+     没有视觉反馈会让人怀疑是不是没点到。 */
+  .ico.nav:active{background:rgba(122,176,255,.34);transform:scale(.9)}
+  .ico.nav{transition:background .14s,transform .08s,color .14s}
+  .ico.on{
+    background:linear-gradient(180deg,rgba(74,144,248,.95),rgba(43,111,224,.95));
+    border-color:rgba(255,255,255,.28);color:#fff;
+    box-shadow:0 2px 10px rgba(47,124,246,.42);
+  }
+  .ico svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.9;
+    stroke-linecap:round;stroke-linejoin:round;display:block}
+  /* 关闭：平时低调，hover 才泛起红 —— 破坏性操作不该和常用按钮抢注意力 */
+  #btnClose{color:rgba(233,235,242,.55)}
+  #btnClose:hover{background:rgba(255,93,85,.20);border-color:rgba(255,93,85,.34);color:#ff8f88}
+
+  /* ---------- 清晰度按钮（标题栏主控件） ---------- */
+  /**
+   * 从「一个像标签的胶囊」升级成明确的**可点按钮**：
+   * 闪电图标 + 当前档位名 + 下拉箭头，三段式，右边带箭头就没人会以为它是只读文本。
+   *
+   * 视觉权重刻意高于其它图标按钮 —— 画质是这排里唯一「业务参数」，
+   * 其余都是窗口操作。用强调色边框 + 主题色文字把它挑出来。
+   */
+  .qbtn{
+    flex:0 0 auto;display:flex;align-items:center;gap:5px;
+    height:26px;padding:0 6px 0 7px;border-radius:9px;
+    font:inherit;font-size:10.5px;font-weight:700;letter-spacing:.01em;
+    color:#a9ccff;
+    background:linear-gradient(180deg,rgba(74,144,248,.20),rgba(74,144,248,.10));
+    border:1px solid rgba(74,144,248,.36);
+    cursor:pointer;user-select:none;
+    transition:background .15s,border-color .15s,box-shadow .15s,transform .08s;
+  }
+  .qbtn:hover{
+    background:linear-gradient(180deg,rgba(74,144,248,.34),rgba(74,144,248,.18));
+    border-color:rgba(122,176,255,.62);
+    box-shadow:0 2px 12px rgba(47,124,246,.26);
+    color:#cfe3ff;
+  }
+  .qbtn:active{transform:translateY(1px)}
+  .qbtn.open{
+    background:linear-gradient(180deg,rgba(74,144,248,.42),rgba(74,144,248,.24));
+    border-color:rgba(122,176,255,.75);color:#fff;
+  }
+  .qbtn.busy{opacity:.55;pointer-events:none}
+  .qbtn .qico{width:11px;height:11px;fill:rgba(160,200,255,.95);stroke:none;flex:0 0 auto}
+  .qbtn .qcaret{width:9px;height:9px;fill:none;stroke:currentColor;stroke-width:2.4;
+    stroke-linecap:round;stroke-linejoin:round;opacity:.62;
+    transition:transform .18s ease,opacity .18s ease;flex:0 0 auto}
+  .qbtn.open .qcaret{transform:rotate(180deg);opacity:1}
+  #qualityText{white-space:nowrap;max-width:58px;overflow:hidden;text-overflow:ellipsis}
+
+  /* ---------- 视频区 ---------- */
+  /**
+   * 黑边问题的正确处理：
+   *
+   * 根因不是 canvas 拉伸，而是「窗口比例 ≠ 视频比例」。
+   * 手机画面 476×1080 ≈ 0.44，窗口去掉标题栏+控制面板后的区域
+   * 如果比这个宽或高，多出来的那块就露出 stage 底色 → 看起来像黑边。
+   *
+   * 现在两条一起做：
+   *   1. 主进程按视频比例把窗口收到刚好（见 win:video-size）
+   *   2. stage 用 #05070a 而不是纯黑，且 canvas 按像素尺寸 + max 约束
+   *      → 万一还有 1~2px 误差，也几乎看不出来
+   *
+   * 注意 stage 不能完全透明：窗口是 transparent 的，透明会直接露出
+   * 桌面（浅色背景时整块发白），必须留一层极暗的底。
+   */
+  #stage{
+    position:relative;flex:1 1 auto;min-height:0;overflow:hidden;
+    background:#05070a;
+    display:flex;align-items:center;justify-content:center;
+  }
+  #video{
+    position:relative;display:block;
+    /**
+     * ══════════ 尺寸由 JS 精确设定，不交给 CSS ══════════
+     *
+     * 这里连着踩了两次坑，记下来免得再犯：
+     *
+     *   ① width/height:auto + max-*:100%
+     *      max-* 只封顶不放大。编码 319×720 的画布在 404×921 的
+     *      stage 里就只占 319×720，四周一大圈底色 —— 用户原话
+     *      「四周这么多黑边」。实测填充率只有 48%。
+     *
+     *   ② width/height:100% + object-fit:contain
+     *      画布铺满了，但 contain 在「窗口比例 ≠ 视频比例」时
+     *      会留等比空白。实测内容 402×720 挤在 404×921 里，
+     *      上下各留 111 / 132px，填充率 78%。
+     *
+     *   ③ 想用 CSS min() 一步解决：min(100%, calc(100vh * ratio))
+     *      不成立 —— ratio 是运行时才知道的值（319/720），
+     *      CSS 里拿不到，写死又会在换分辨率后失效。
+     *
+     * ── 现在的做法 ──
+     *
+     * fitCanvas() 在每次 stage 尺寸变化 / 视频尺寸变化时量一次
+     * 舞台盒，按比例算出「能塞进去的最大尺寸」，直接写成 px。
+     * 浏览器不需要猜，也就不可能留错边。
+     */
+    flex:0 0 auto;
+    opacity:var(--content-op);
+    /**
+     * 缩小时的采样策略 —— 直接影响文字清晰度。
+     *
+     * auto          浏览器默认，缩小用双线性，小字容易糊
+     * high-quality  高质量重采样，保留笔画细节（Chrome 对 canvas 支持）
+     * -webkit-optimize-contrast  锐化边缘，小字更锐
+     *
+     * 配合下面 will-change:transform 让 Chromium 走 GPU 合成，
+     * 避免 CPU 缩放的二次损失。
+     */
+    image-rendering:-webkit-optimize-contrast;
+    image-rendering:high-quality;
+    will-change:transform;
+    transform:translateZ(0);
+    /* 缩放时保持比例，不拉伸 */
+    object-fit:contain;
+    /* 反向控制：画面上按下鼠标要去点手机对应位置，
+       cursor 用 pointer 明确「这里可以点」，不然用户不知道能操作。 */
+    cursor:pointer;
+    touch-action:none;
+  }
+  /* 控制中（有按下未抬起）时给一圈高亮，反馈操作已生效 */
+  #stage.ctl-active #video{outline:2px solid rgba(122,176,255,.55);outline-offset:-2px}
+  /**
+   * 空状态（未出画面时）。
+   *
+   * 旧版就是三行裸文本浮在黑底上 —— 断线时用户看到的是「一块黑洞 + 两句话」，
+   * 既不知道这是「正常等待」还是「已经挂了」。现在做成标准 empty state：
+   *   · 一层径向渐变压底，盖住上一帧残留，文字永远可读
+   *   · z-index 抬到画布之上（否则残留画面会盖住提示）
+   *   · 图标块用主题色 + 呼吸动画，暗示「还在跑，不是死的」
+   */
+  /* ---------- 息屏遮罩 ---------- *
+     z-index 压在画布之上、占位层之下：息屏时占位层本来是隐藏的，
+     所以这里只要盖住最后一帧即可。 */
+  #sleepMask{
+    position:absolute;inset:0;z-index:3;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;gap:9px;
+    background:rgba(6,9,15,.58);
+    -webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px);
+    opacity:0;pointer-events:none;
+    transition:opacity .22s ease;
+  }
+  #sleepMask.on{opacity:1}
+  #sleepMask .sm-art{
+    width:52px;height:52px;border-radius:16px;display:grid;place-items:center;
+    background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.11);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.07);
+  }
+  #sleepMask .sm-art svg{
+    width:22px;height:22px;fill:none;stroke:rgba(233,235,242,.72);
+    stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;
+  }
+  #sleepMask .sm-t{font-size:12.5px;font-weight:650;color:rgba(233,235,242,.92)}
+  #sleepMask .sm-s{font-size:10.5px;color:rgba(233,235,242,.42)}
+
+  /* ---------- 切档位遮罩（复用息屏那套排版 + 转圈）---------- */
+  #switchMask{
+    position:absolute;inset:0;z-index:4;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;gap:9px;
+    background:rgba(6,9,15,.62);
+    -webkit-backdrop-filter:blur(2px);backdrop-filter:blur(2px);
+    opacity:0;pointer-events:none;
+    transition:opacity .2s ease;
+  }
+  #switchMask.on{opacity:1}
+  #switchMask .sm-t{font-size:12.5px;font-weight:650;color:rgba(233,235,242,.92)}
+  #switchMask .sm-s{font-size:10.5px;color:rgba(233,235,242,.42)}
+  /* 转圈：只用 transform 动画，不触发布局/绘制，切换期间不抢帧 */
+  #switchMask .sw-ring{
+    width:34px;height:34px;border-radius:50%;
+    border:2.5px solid rgba(122,176,255,.22);
+    border-top-color:#7ab0ff;
+    animation:mw-spin .8s linear infinite;
+  }
+  @keyframes mw-spin{to{transform:rotate(360deg)}}
+
+  #placeholder{
+    position:absolute;inset:0;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:12px;padding:26px;text-align:center;
+    background:radial-gradient(130% 95% at 50% 42%,rgba(23,29,42,.955),rgba(8,11,17,.99));
+    opacity:var(--content-op);z-index:2;
+  }
+  #placeholder .art{
+    width:62px;height:62px;border-radius:18px;display:grid;place-items:center;
+    background:linear-gradient(180deg,rgba(74,144,248,.20),rgba(74,144,248,.06));
+    border:1px solid rgba(122,176,255,.26);
+    box-shadow:0 10px 26px -12px rgba(47,124,246,.75),inset 0 1px 0 rgba(255,255,255,.09);
+    animation:mw-breathe 2.8s ease-in-out infinite;
+  }
+  @keyframes mw-breathe{
+    0%,100%{transform:translateY(0);opacity:1}
+    50%{transform:translateY(-3px);opacity:.82}
+  }
+  #placeholder .art svg{
+    width:26px;height:26px;fill:none;stroke:rgba(169,204,255,.92);
+    stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;
+  }
+  #phTitle{
+    font-size:13px;color:rgba(233,235,242,.92);font-weight:650;letter-spacing:.01em;
+  }
+  #phBody{
+    font-size:11px;color:rgba(233,235,242,.46);line-height:1.7;
+    max-width:250px;
+  }
+
+  /* ---------- 控制面板：浮层，不占布局 ---------- */
+  /**
+   * 参考 QQ 迷你窗的做法：设置面板是**浮层**，覆盖在画面上方，
+   * 而不是从底部把内容挤上去。
+   *
+   * 之前用 grid 0fr/1fr 做「收起」，视觉上收起来了，但它仍然是 flex
+   * 布局里的一项 —— 展开时把 stage 压扁，收起时又要通知主进程重算
+   * 窗口高度，一来一回很容易出现「宽度不对 / 画面被裁」。
+   *
+   * 改成 absolute 浮层之后：面板彻底脱离文档流，
+   * 窗口尺寸只由标题栏 + 视频决定，展开收起对布局零影响。
+   */
+  #panel{
+    position:absolute;left:8px;right:8px;top:46px;z-index:58;
+    display:flex;flex-direction:column;gap:8px;
+    padding:11px 11px 12px;
+    background:linear-gradient(180deg,rgba(33,38,50,.985),rgba(20,24,33,.985));
+    border:1px solid rgba(255,255,255,.115);
+    border-radius:14px;
+    box-shadow:0 18px 44px rgba(0,0,0,.62),0 3px 10px rgba(0,0,0,.42),
+               inset 0 1px 0 rgba(255,255,255,.06);
+
+    /* 收起：淡出 + 轻微上移。脱离流之后高度动画没有意义 */
+    opacity:0;pointer-events:none;
+    transform:translateY(-6px) scale(.985);
+    transform-origin:top center;
+    transition:opacity .16s ease, transform .18s cubic-bezier(.2,.9,.3,1);
+  }
+  #panel.open{
+    opacity:1;pointer-events:auto;
+    transform:translateY(0) scale(1);
+  }
+
+  /* ---------- 滑杆行 ---------- */
+  .row{display:grid;grid-template-columns:64px 1fr 40px;align-items:center;gap:10px}
+  .row .n{
+    font-size:11px;color:rgba(233,235,242,.62);white-space:nowrap;
+    overflow:hidden;text-overflow:ellipsis;letter-spacing:.005em;
+    display:flex;align-items:center;gap:5px;min-width:0;
+  }
+  .row .n span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  /* 滑杆左侧小图标：窄窗时替代文字，永远看得懂 */
+  .lbl-ico{
+    width:12px;height:12px;flex:0 0 auto;fill:none;stroke:rgba(233,235,242,.5);
+    stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;display:none;
+  }
+  /* 数值做成小胶囊：固定宽度 + 等宽数字，拖动时不会左右跳 */
+  .row .v{
+    font-size:10px;font-weight:600;color:rgba(233,235,242,.72);text-align:center;
+    font-variant-numeric:tabular-nums;font-family:Consolas,monospace;white-space:nowrap;
+    background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.075);
+    border-radius:6px;padding:2px 0;line-height:1.4;
+  }
+  .abbr{display:none}
+
+  /**
+   * 滑杆。
+   *
+   * 旧版是 4px 细条 + 13px 白点，在深色面板上对比度太低 ——
+   * 用户反馈「看不见拖到哪了」。现在：
+   *   · 轨道 5px 带内阴影（凹槽感），底色提亮到 .13
+   *   · 已填充段用渐变 + 外发光，一眼看出当前值
+   *   · 滑块白底 + 蓝色描边 + 投影，hover 再加一圈光晕
+   */
+  .sl{position:relative;height:18px;display:flex;align-items:center;cursor:pointer}
+  .sl-t{
+    position:relative;width:100%;height:5px;border-radius:3px;
+    background:rgba(255,255,255,.13);
+    box-shadow:inset 0 1px 2px rgba(0,0,0,.45);
+  }
+  .sl-f{
+    position:absolute;left:0;top:0;bottom:0;border-radius:3px;width:calc(var(--v)*100%);
+    background:linear-gradient(90deg,#2f7cf6,#79b0ff);
+    box-shadow:0 0 8px rgba(60,130,246,.42);
+  }
+  .sl-h{
+    position:absolute;left:calc(var(--v)*100%);top:50%;width:14px;height:14px;border-radius:50%;
+    background:#fff;border:2px solid #3f88f8;transform:translate(-50%,-50%);
+    box-shadow:0 2px 6px rgba(0,0,0,.5);
+    transition:box-shadow .14s,transform .1s;
+  }
+  .sl:hover .sl-h,.sl.drag .sl-h{
+    box-shadow:0 2px 6px rgba(0,0,0,.5),0 0 0 4px rgba(47,124,246,.25);
+  }
+  .sl.drag .sl-h{transform:translate(-50%,-50%) scale(1.08)}
+
+  /* 分组之间的细分隔线 */
+  .psep{height:1px;background:rgba(255,255,255,.075);margin:0 1px}
+
+  /* ---------- 按钮 ---------- */
+  #ctrls{display:flex;flex-direction:column;gap:6px;margin-top:1px}
+  .pgroup{display:flex;align-items:center;gap:6px;min-width:0}
+
+  .chip{
+    flex:1 1 0;min-width:0;height:30px;border-radius:9px;
+    display:flex;align-items:center;justify-content:center;gap:5px;
+    font-size:11px;font-weight:600;color:rgba(233,235,242,.82);
+    background:rgba(255,255,255,.065);border:1px solid rgba(255,255,255,.10);
+    cursor:pointer;white-space:nowrap;
+    transition:background .14s,border-color .14s,color .14s,transform .08s;
+    letter-spacing:.005em;padding:0 6px;
+  }
+  /* 按钮里的图标：任何尺寸都显示，文字可以藏 */
+  .chip .ci{
+    width:14px;height:14px;flex:0 0 auto;fill:none;stroke:currentColor;
+    stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;display:block;
+    opacity:.9;
+  }
+  .chip:hover{background:rgba(255,255,255,.13);border-color:rgba(255,255,255,.18);color:#fff}
+  .chip:active{transform:translateY(1px)}
+  .chip.on{
+    background:linear-gradient(180deg,#3f88f8,#286bd8);color:#fff;
+    border-color:rgba(255,255,255,.28);box-shadow:0 2px 8px rgba(47,124,246,.35);
+  }
+  .chip.stop{background:rgba(255,92,84,.15);border-color:rgba(255,92,84,.34);color:#ffa9a3}
+  .chip.stop:hover{background:rgba(255,92,84,.25)}
+
+  /**
+   * 缩放步进器：− 和 + 合成一个整体。
+   *
+   * 原来是两个独立的 flex 按钮，被 比例 / 重置 挤成 35px 的小方块，
+   * 视觉上和别的按钮平级 —— 但它们是「同一件事的两半」。
+   * 现在共用一个底板，中间只留 4px 缝，一眼看出是一组。
+   */
+  .stepper{
+    display:flex;flex:1 1 0;min-width:0;gap:0;
+    background:rgba(255,255,255,.065);
+    border:1px solid rgba(255,255,255,.10);
+    border-radius:9px;overflow:hidden;
+  }
+  /* 里面的两个按钮去掉自己的边框/圆角，做成一个整体控件，
+     中间用 1px 内阴影当分隔线 —— 一眼看出「这是缩放器的 − 和 +」 */
+  .stepper .chip{
+    flex:1 1 0;height:28px;border:0;border-radius:0;background:transparent;
+  }
+  .stepper .chip + .chip{box-shadow:inset 1px 0 0 rgba(255,255,255,.10)}
+  .stepper .chip:hover{background:rgba(255,255,255,.10);border:0}
+  .stepper .chip:active{background:rgba(47,124,246,.26)}
+
+  /* 三档紧凑。
+     核心原则：文字可以藏，图标永远在 —— 窄窗下按钮只剩图标也比只剩
+     一个汉字好认（之前缩到 181px 时显示「比」「投」「重」，完全看不懂）。 */
+  body[data-size="sm"] .row{grid-template-columns:34px 1fr 32px;gap:8px}
+  body[data-size="sm"] .full{display:none}
+  body[data-size="sm"] .abbr{display:inline}
+
+  /* ---------- 顶部栏五档收缩（按窗口宽度，见 computeTier）----------
+     原则：先砍只读信息（帧率 → 状态文字 → 清晰度文字），
+     再砍装饰（分隔线），最后才缩按钮 ——
+     按钮是唯一「点了有用」的东西，永远留到最后。
+
+     每一档的宽度预算都实测过（临时把窗口调到档位下限验证 scrollWidth ≤ clientWidth）：
+
+       411px  lg   全量             → 409 / 409
+       340px  md   砍帧率 + 分隔线   → 338 / 338
+       300px  sm   砍状态文字 + 清晰度文字
+       240px  xs   图标 21 + 更紧间距
+       180px  xxs  图标 19，极限压缩
+     */
+  body[data-size="md"] #bar{height:44px;gap:3px;padding:0 7px}
+  body[data-size="md"] #meta{display:none}
+  body[data-size="md"] .ico{width:24px;height:24px;border-radius:8px}
+  body[data-size="md"] .sep{display:none}
+
+  body[data-size="sm"] #bar{height:42px;gap:3px;padding:0 7px}
+  body[data-size="sm"] #meta,body[data-size="sm"] #title{display:none}
+  body[data-size="sm"] .statuspill{padding:0 8px;height:22px}
+  body[data-size="sm"] .sep{display:none}
+  body[data-size="sm"] .ico{width:23px;height:23px;border-radius:8px}
+  body[data-size="sm"] .qbtn{padding:0 5px;height:24px;gap:0}
+  body[data-size="sm"] #qualityText,body[data-size="sm"] .qbtn .qcaret{display:none}
+
+  body[data-size="xs"] #bar{height:40px;gap:2px;padding:0 6px}
+  body[data-size="xs"] #meta,body[data-size="xs"] #title{display:none}
+  body[data-size="xs"] .statuspill{padding:0 7px;height:21px}
+  body[data-size="xs"] .sep{display:none}
+  body[data-size="xs"] .ico{width:21px;height:21px;border-radius:7px}
+  body[data-size="xs"] .ico svg{width:12px;height:12px}
+  body[data-size="xs"] .qbtn{padding:0 5px;height:21px;gap:0;border-radius:7px}
+  body[data-size="xs"] #qualityText,body[data-size="xs"] .qbtn .qcaret{display:none}
+
+  body[data-size="xxs"] #bar{height:36px;gap:2px;padding:0 5px}
+  body[data-size="xxs"] #meta,body[data-size="xxs"] #title{display:none}
+  body[data-size="xxs"] .statuspill{padding:0 5px;height:19px;gap:0;border-radius:10px}
+  body[data-size="xxs"] .sep{display:none}
+  body[data-size="xxs"] .ico{width:19px;height:19px;border-radius:6px}
+  body[data-size="xxs"] .ico svg{width:11px;height:11px}
+  body[data-size="xxs"] .qbtn{padding:0 4px;height:19px;gap:0;border-radius:6px}
+  body[data-size="xxs"] #qualityText,body[data-size="xxs"] .qbtn .qcaret{display:none}
+  body[data-size="sm"] #panel{padding:9px 10px 10px;gap:8px}
+
+  /* xs：滑杆标签改成纯图标，按钮也变纯图标 */
+  body[data-size="xs"] .row{grid-template-columns:16px 1fr 30px;gap:7px}
+  body[data-size="xs"] .full,body[data-size="xs"] .abbr{display:none}
+  body[data-size="xs"] .lbl-ico{display:block}
+  body[data-size="xs"] #meta,body[data-size="xs"] #title{display:none}
+  body[data-size="xs"] #ctrls .chip{
+    height:24px;border-radius:7px;padding:0;gap:0;
+  }
+  body[data-size="xs"] #ctrls .chip .full{display:none}
+  body[data-size="xs"] #ctrls .chip .ci{width:13px;height:13px}
+  body[data-size="xs"] #ctrls .chip.wide{flex:1 1 0}
+  body[data-size="xs"] #panel{padding:8px;gap:7px}
+
+  /* xxs（<150px）：极窄，把百分比数值也去掉，只留滑杆和图标按钮 */
+  body[data-size="xxs"] .row{grid-template-columns:14px 1fr;gap:6px}
+  body[data-size="xxs"] .row .v{display:none}
+  body[data-size="xxs"] .full,body[data-size="xxs"] .abbr{display:none}
+  body[data-size="xxs"] .lbl-ico{display:block}
+  body[data-size="xxs"] #meta,body[data-size="xxs"] #title{display:none}
+  body[data-size="xxs"] #ctrls .chip{height:23px;padding:0;gap:0;border-radius:6px}
+  body[data-size="xxs"] #ctrls .chip .full{display:none}
+  body[data-size="xxs"] #ctrls .chip .ci{width:12px;height:12px}
+  body[data-size="xxs"] #ctrls .chip.wide{flex:1 1 0}
+  body[data-size="xxs"] #panel{padding:7px;gap:6px}
+
+  /**
+   * 缩放握点。
+   *
+   * 这里踩过一个很隐蔽的坑：所有握点原本都是 z-index:60，
+   * 而 #bar（标题栏，拖动区）没有设 z-index。
+   * .rz-n 覆盖顶部整条边缘（top:0; height:var(--hz)），于是它盖在标题栏之上 ——
+   * 用户点标题栏想拖动，实际抓到的是「向上缩放」的把手，
+   * 表现为「窗口拖不动」，而且完全没有任何出错提示。
+   *
+   * 现在：
+   *   - 给 #bar 一个更高的层级，保证顶部这条永远属于拖动区
+   *   - .rz-n 的 z-index 降到比 bar 低
+   *   - 上边角（nw/ne）仍然压在 bar 上，因为角上缩放更符合直觉，
+   *     而且角很小不会挡住整条拖动区
+   */
+  .rz{position:absolute;z-index:60}
+  .rz-n{top:0;left:var(--hz);right:var(--hz);height:var(--hz);cursor:ns-resize;z-index:50}
+  .rz-s{bottom:0;left:var(--hz);right:var(--hz);height:var(--hz);cursor:ns-resize}
+  .rz-w{left:0;top:var(--hz);bottom:var(--hz);width:var(--hz);cursor:ew-resize}
+  .rz-e{right:0;top:var(--hz);bottom:var(--hz);width:var(--hz);cursor:ew-resize}
+  .rz-nw{left:0;top:0;width:calc(var(--hz)*1.6);height:calc(var(--hz)*1.6);cursor:nwse-resize}
+  .rz-ne{right:0;top:0;width:calc(var(--hz)*1.6);height:calc(var(--hz)*1.6);cursor:nesw-resize}
+  .rz-sw{left:0;bottom:0;width:calc(var(--hz)*1.6);height:calc(var(--hz)*1.6);cursor:nesw-resize}
+  .rz-se{right:0;bottom:0;width:calc(var(--hz)*1.6);height:calc(var(--hz)*1.6);cursor:nwse-resize}
+  body.rz-active #shell{outline:1px solid rgba(122,176,255,.75);outline-offset:-1px}
+  #ghost{position:absolute;right:8px;bottom:8px;z-index:70;pointer-events:none;
+    padding:4px 9px;border-radius:7px;font-size:11px;font-variant-numeric:tabular-nums;
+    font-family:Consolas,monospace;color:#cfe3ff;background:rgba(9,13,21,.85);
+    border:1px solid rgba(122,176,255,.42);opacity:0;transition:opacity .12s}
+  body.rz-active #ghost{opacity:1}
+
+  /* 日志抽屉已移除：日志只写控制台，用户界面不展示 */
+
+  /* ---------- 音量弹层 ---------- */
+  /**
+   * 位置：贴在音量按钮正下方。
+   *
+   * 之前用 right:34px 硬编码，和设置面板（top:46px 覆盖整行）撞在一起，
+   * 打开面板再点音量就叠成一团。
+   *
+   * 现在：
+   *   - 音量弹层 z-index 高于设置面板（64 > 58），确保在上面
+   *   - 面板打开时把音量弹层往右挪一点并稍微透明化，避免视觉打架
+   *   - 顶部定位跟随按钮行，不会盖住视频主体
+   */
+  #volPop{
+    position:absolute;right:8px;top:44px;z-index:64;
+    width:54px;padding:11px 0 9px;
+    display:flex;flex-direction:column;align-items:center;gap:9px;
+    background:linear-gradient(180deg,rgba(33,38,50,.985),rgba(20,24,33,.985));
+    border:1px solid rgba(255,255,255,.115);
+    border-radius:14px;
+    box-shadow:0 18px 44px rgba(0,0,0,.62),0 3px 10px rgba(0,0,0,.42),
+               inset 0 1px 0 rgba(255,255,255,.06);
+    opacity:0;pointer-events:none;
+    transform:translateY(-6px) scale(.96);
+    transform-origin:top right;
+    transition:opacity .15s ease, transform .17s cubic-bezier(.2,.9,.3,1);
+  }
+  #volPop.open{opacity:1;pointer-events:auto;transform:none}
+  /* 顶部小喇叭：告诉用户这是什么东西 —— 42px 宽的旧版只有一个光秃秃的滑轨 */
+  #volPop .vico{
+    width:15px;height:15px;flex:0 0 auto;
+    fill:none;stroke:rgba(233,235,242,.62);stroke-width:1.8;
+    stroke-linecap:round;stroke-linejoin:round;
+  }
+  /* 竖向轨道：宽度 8px，比旧版 6px 好抓；hover/拖动时滑块放大 */
+  #volTrack{
+    position:relative;width:8px;height:96px;border-radius:5px;
+    background:rgba(255,255,255,.13);cursor:pointer;
+    box-shadow:inset 0 1px 3px rgba(0,0,0,.5);
+    /* 让点击区域比视觉宽度大，不然窄窗口里很难点准 */
+    padding:0;margin:0 12px;
+  }
+  #volFill{
+    position:absolute;left:0;right:0;bottom:0;border-radius:5px;
+    background:linear-gradient(180deg,#79b0ff,#2f7cf6);
+    box-shadow:0 0 8px rgba(60,130,246,.45);
+    height:calc(var(--v,1) * 100%);
+  }
+  #volKnob{
+    position:absolute;left:50%;width:16px;height:16px;border-radius:50%;
+    background:#fff;border:2px solid #3f88f8;
+    box-shadow:0 2px 7px rgba(0,0,0,.55);
+    transform:translate(-50%,50%);
+    bottom:calc(var(--v,1) * 100%);
+    transition:box-shadow .14s,transform .1s;
+  }
+  #volTrack:hover #volKnob,#volPop.drag #volKnob{
+    box-shadow:0 2px 7px rgba(0,0,0,.55),0 0 0 5px rgba(47,124,246,.24);
+  }
+  #volPop.drag #volKnob{transform:translate(-50%,50%) scale(1.08)}
+  #volVal{
+    font:10px/1 Consolas,monospace;font-weight:600;
+    color:rgba(233,235,242,.75);
+    font-variant-numeric:tabular-nums;
+    background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.075);
+    border-radius:6px;padding:3px 0;width:38px;text-align:center;
+  }
+
+  /* ==========================================================================
+     弹出菜单（清晰度 / 更多）—— 共用一套外观
+     --------------------------------------------------------------------------
+     商业级细节：
+       · 12px 圆角 + 双层阴影（近处硬边、远处弥散），浮起来才有「层」的感觉
+       · 顶栏标题行 + 分隔线，长列表不会糊成一团
+       · 进场 130ms 的轻微上浮 + 缩放，方向感来自 transform-origin
+       · 每行右侧留固定宽度的状态位（✓ / 数值），文字不会左右跳
+     ========================================================================== */
+  #qualityMenu,#moreMenu{
+    position:absolute;z-index:120;top:48px;right:8px;
+    min-width:196px;padding:6px;
+    background:linear-gradient(180deg,rgba(30,35,47,.995),rgba(20,24,33,.995));
+    border:1px solid rgba(255,255,255,.115);border-radius:12px;
+    box-shadow:0 18px 44px rgba(0,0,0,.66),0 3px 10px rgba(0,0,0,.5),
+               inset 0 1px 0 rgba(255,255,255,.06);
+    display:none;
+    transform-origin:top right;
+    animation:mw-menu-in .13s cubic-bezier(.2,.9,.3,1);
+  }
+  #qualityMenu.open,#moreMenu.open{display:block}
+  @keyframes mw-menu-in{
+    from{opacity:0;transform:translateY(-5px) scale(.965)}
+    to{opacity:1;transform:none}
+  }
+  .mhead{
+    display:flex;align-items:center;justify-content:space-between;gap:8px;
+    padding:5px 9px 6px;font-size:10px;font-weight:700;letter-spacing:.06em;
+    text-transform:uppercase;color:rgba(233,235,242,.38);
+  }
+  .mhead .mhint{font-weight:600;letter-spacing:0;text-transform:none;
+    color:rgba(233,235,242,.26);font-family:Consolas,monospace;font-size:9.5px}
+  .msep{height:1px;background:rgba(255,255,255,.08);margin:4px 6px}
+
+  .qitem{
+    display:grid;grid-template-columns:1fr auto 14px;align-items:center;gap:9px;
+    padding:8px 9px;border-radius:8px;font-size:12px;
+    color:rgba(233,235,242,.84);cursor:pointer;
+    transition:background .12s,color .12s;
+  }
+  .qitem:hover{background:rgba(255,255,255,.075);color:#fff}
+  .qitem .qn{font-weight:650;white-space:nowrap}
+  .qitem .qd{
+    font-size:9.5px;color:rgba(233,235,242,.40);font-variant-numeric:tabular-nums;
+    font-family:Consolas,"Cascadia Mono",monospace;white-space:nowrap;
+  }
+  .qitem.on{background:rgba(74,144,248,.16)}
+  .qitem.on .qn{color:#a9ccff}
+  .qitem.on .qd{color:rgba(169,204,255,.62)}
+  .qitem .qtick{
+    font-size:11px;line-height:1;color:#5fd394;opacity:0;text-align:center;
+    transition:opacity .12s;
+  }
+  .qitem.on .qtick{opacity:1}
+
+  /* ---------- 「更多」菜单里的行 ---------- */
+  .mitem{
+    display:grid;grid-template-columns:16px 1fr auto;align-items:center;gap:9px;
+    padding:8px 9px;border-radius:8px;font-size:12px;
+    color:rgba(233,235,242,.84);cursor:pointer;
+    transition:background .12s,color .12s;
+  }
+  .mitem:hover{background:rgba(255,255,255,.075);color:#fff}
+  .mitem svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:1.8;
+    stroke-linecap:round;stroke-linejoin:round;opacity:.8}
+  .mitem .mstate{
+    font-size:10px;color:rgba(233,235,242,.34);
+    font-family:Consolas,monospace;letter-spacing:.01em;white-space:nowrap;
+  }
+  .mitem.on .mstate{color:#7fb4ff}
+  .mitem.on{background:rgba(74,144,248,.14)}
+  .mitem .mstate.on{color:#5fd394}
+</style>
+</head>
+<body>
+
+<div id="shell">
+  <div id="content">
+
+    <div id="bar">
+      <!--
+        ══════════ 左：只读信息区 ══════════
+
+        状态胶囊 = 连接指示灯 + 一句话状态。
+        点它不做任何事（那是拖动区），只负责「一眼看清现在什么状态」：
+            绿点「投屏中」/ 黄点「连接中…」/ 红点「连接失败」
+        设备型号不放在这儿 —— 411px 宽会被压成「HBN ...」，
+        既占位又没信息量，挪进「更多」菜单里。
+      -->
+      <div class="statuspill" title="连接状态">
+        <span id="dot"></span>
+        <span id="title">MiniWin</span>
+      </div>
+
+      <!-- 实时指标：只留帧率。分辨率/编码器属于诊断信息，也在「更多」里 -->
+      <span id="meta" title="实时帧率">-- fps</span>
+
+      <!-- 弹性留白：把操作区推到右边，同时是最好用的拖动热区 -->
+      <span class="bgrow"></span>
+
+      <!--
+        ══════════ 清晰度（本排唯一业务参数，做成主按钮）══════════
+
+        闪电图标 + 档位名 + 下拉箭头。三个元素共同传达「这是一个下拉选择器」，
+        比原来那个纯文字胶囊清楚得多 —— 之前它就长得像只读标签，
+        用户根本不知道能点。
+
+        点开 → #qualityMenu 列出全部档位（名称 + 分辨率 + 帧率 + 勾选），
+        选中即热切换（约 4~5 秒，期间黑一下）。
+      -->
+      <button class="qbtn" id="qualityChip" title="清晰度">
+        <svg class="qico" viewBox="0 0 24 24"><path d="M13.5 2 4 13.2h5.3L8.6 22 18 10.6h-5.2L13.5 2z"/></svg>
+        <span id="qualityText">清晰度</span>
+        <svg class="qcaret" viewBox="0 0 24 24"><path d="M7 10l5 5 5-5"/></svg>
+      </button>
+
+      <span class="sep"></span>
+
+      <!-- ══════════ 手机导航组：返回 / 桌面 ══════════ -->
+      <div class="ico nav" id="btnBack" title="返回（手机）">
+        <svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg>
+      </div>
+      <div class="ico nav" id="btnHome" title="回到桌面（手机）">
+        <svg viewBox="0 0 24 24"><path d="M4 10.8 12 4.5l8 6.3"/><path d="M6.2 10v8.2a1.4 1.4 0 0 0 1.4 1.4h8.8a1.4 1.4 0 0 0 1.4-1.4V10"/></svg>
+      </div>
+
+      <span class="sep"></span>
+
+      <!-- ══════════ 置顶 / 音量 ══════════ -->
+      <!--
+        置顶：原来这一格是「暂停」。
+        暂停是低频动作（且有快捷键兜底），置顶才是投屏时的刚需 ——
+        切到别的窗口继续看，回来还压在别人上面。所以标题栏这一格让给置顶：
+        .on 亮起 = 当前已置顶，点一下切换。
+      -->
+      <div class="ico" id="btnTop" title="窗口置顶：关（点击开启）">
+        <svg viewBox="0 0 24 24">
+          <path d="M9.2 3.6h5.6l-.9 5.4 2.9 3.1v1.1H7.2V12.1l2.9-3.1-.9-5.4z"/>
+          <path d="M12 13.2V21"/>
+        </svg>
+      </div>
+      <!-- 音量：点开弹出竖向滑块 -->
+      <div class="ico" id="btnVol" title="音量">
+        <svg viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7"/></svg>
+      </div>
+
+      <!--
+        ══════════ 更多（⋯）══════════
+
+        把「设置 / 置顶」这两项低频操作收进溢出菜单，
+        标题栏就从 7 个按钮降到 5 个 —— 这是所有商业客户端的通行做法：
+        高频操作平铺，低频操作收纳，破坏性操作（关闭）单独放最右。
+      -->
+      <div class="ico" id="btnMore" title="更多">
+        <svg viewBox="0 0 24 24"><circle cx="5.5" cy="12" r="1.15"/><circle cx="12" cy="12" r="1.15"/><circle cx="18.5" cy="12" r="1.15"/></svg>
+      </div>
+
+      <div class="ico" id="btnClose" title="关闭 (Esc)">
+        <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </div>
+    </div>
+
+    <div id="stage">
+      <!-- 默认隐藏：第一帧画上来之前不要显示一块空白的 360×640 画布 -->
+      <canvas id="video" width="360" height="640" style="display:none"></canvas>
+      <!--
+        息屏遮罩 —— 手机息屏时盖住最后一帧。
+        用半透明 + 轻微模糊，而不是整块黑：用户能看到「画面还在，只是停了」，
+        亮屏后这一层淡出、画面直接接上，观感是「跟上」而不是「重连」。
+      -->
+      <div id="sleepMask">
+        <div class="sm-art">
+          <svg viewBox="0 0 24 24"><path d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5 8.5 8.5 0 1 0 20.5 14.2z"/></svg>
+        </div>
+        <div class="sm-t">手机已息屏</div>
+        <div class="sm-s">点亮手机后画面自动接上</div>
+      </div>
+      <!--
+        切档位遮罩 —— 重建编码器要 3~6 秒，这期间画面停在最后一帧。
+        没有提示的话用户会以为卡死了（之前只能干等，什么都看不出来）。
+      -->
+      <div id="switchMask">
+        <div class="sw-ring"></div>
+        <div class="sm-t">正在切换到「<span id="switchName">标准</span>」</div>
+        <div class="sm-s">重建编码器，约 3~6 秒</div>
+      </div>
+      <div id="placeholder">
+        <div class="art">
+          <svg viewBox="0 0 24 24">
+            <rect x="6" y="2" width="12" height="20" rx="2.5"/>
+            <path d="M11 18.5h2"/>
+          </svg>
+        </div>
+        <div id="phTitle">正在连接手机…</div>
+        <div id="phBody">手机连同一个 WiFi 即可，不用装 App、不用扫码</div>
+      </div>
+    </div>
+
+  </div>
+
+  <!--
+    设置面板是浮层，挂在 #shell 下、绝对定位覆盖在画面上。
+    放在这里而不是 #content 里，是因为 #content 是 flex 列布局 ——
+    作为它的子项就会占据高度。放到外面才能真正确底不参与布局。
+  -->
+  <div id="panel">
+      <div class="row">
+        <span class="n">
+          <svg class="lbl-ico" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v18"/></svg>
+          <span class="full">内容透明度</span><span class="abbr">内容</span>
+        </span>
+        <div class="sl" id="slContent"><div class="sl-t"><div class="sl-f"></div><div class="sl-h"></div></div></div>
+        <span class="v" id="vContent">100%</span>
+      </div>
+      <div class="row">
+        <span class="n">
+          <svg class="lbl-ico" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="3"/><rect x="8" y="8" width="8" height="8" rx="1"/></svg>
+          <span class="full">背景透明度</span><span class="abbr">背景</span>
+        </span>
+        <div class="sl" id="slBg"><div class="sl-t"><div class="sl-f"></div><div class="sl-h"></div></div></div>
+        <span class="v" id="vBg">100%</span>
+      </div>
+
+      <div class="psep"></div>
+
+      <!--
+        按钮分两行两组（原来是六个挤一行，被压成 35/47/35 的参差宽度）：
+
+          第一行 · 视图   比例 | − + | 重置
+          第二行 · 连接   重连 | WiFi
+
+        同一件事的两半（− / +）用 .stepper 包起来，视觉上成一个控件；
+        视图和连接之间换行，扫视成本从「六个都要看」降到「两行各看一次」。
+      -->
+      <div id="ctrls">
+        <div class="pgroup">
+          <div class="chip on" id="btnRatio" title="保持手机画面比例">
+            <svg class="ci" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2.5"/><path d="M4 9h16M9 4v16"/></svg>
+            <span class="full">比例</span>
+          </div>
+          <div class="stepper">
+            <div class="chip" id="btnMinus" title="缩小">
+              <svg class="ci" viewBox="0 0 24 24"><path d="M6 12h12"/></svg>
+            </div>
+            <div class="chip" id="btnPlus" title="放大">
+              <svg class="ci" viewBox="0 0 24 24"><path d="M12 6v12M6 12h12"/></svg>
+            </div>
+          </div>
+          <div class="chip" id="btnReset" title="恢复默认尺寸和透明度">
+            <svg class="ci" viewBox="0 0 24 24"><path d="M3.5 12a8.5 8.5 0 1 0 2.6-6.1"/><path d="M3 4v5h5"/></svg>
+            <span class="full">重置</span>
+          </div>
+        </div>
+        <div class="pgroup">
+          <div class="chip" id="btnStart" title="重新连接手机">
+            <svg class="ci" viewBox="0 0 24 24"><path d="M20 11a8 8 0 0 0-14-4.5L4 9"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14 4.5L20 15"/><path d="M20 20v-5h-5"/></svg>
+            <span class="full">重连</span>
+          </div>
+          <div class="chip" id="btnWifi" title="自动发现并连接同一 WiFi 下的手机（不用输 IP、不用扫码）">
+            <svg class="ci" viewBox="0 0 24 24"><path d="M3.5 9.5a13 13 0 0 1 17 0"/><path d="M6.8 13.2a8.3 8.3 0 0 1 10.4 0"/><path d="M9.9 16.8a3.6 3.6 0 0 1 4.2 0"/><circle cx="12" cy="20" r="1.2"/></svg>
+            <span class="full">WiFi</span>
+          </div>
+        </div>
+      </div>
+  </div>
+
+  <div class="rz rz-n" data-dir="n"></div>
+  <div class="rz rz-s" data-dir="s"></div>
+  <div class="rz rz-w" data-dir="w"></div>
+  <div class="rz rz-e" data-dir="e"></div>
+  <div class="rz rz-nw" data-dir="nw"></div>
+  <div class="rz rz-ne" data-dir="ne"></div>
+  <div class="rz rz-sw" data-dir="sw"></div>
+  <div class="rz rz-se" data-dir="se"></div>
+  <!--
+    音量弹层：点顶部音量图标从下方滑出。
+    竖向滑块比横向更省横向空间（窗口本身很窄），
+    也符合「音量」这个概念的直觉（调音台推子）。
+  -->
+  <div id="volPop">
+    <svg class="vico" viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7"/><path d="M19.5 6a9 9 0 0 1 0 12"/></svg>
+    <div id="volTrack"><div id="volFill"></div><div id="volKnob"></div></div>
+    <div id="volVal">100%</div>
+  </div>
+
+  <!--
+    清晰度下拉 —— 点标题栏的 #qualityChip 展开。
+    内容由 JS 按主进程的 TIERS 动态生成，这里不放死数据。
+  -->
+  <div id="qualityMenu"></div>
+
+  <!--
+    「更多」菜单 —— 收纳低频操作 + 设备信息。
+
+    这里放的是原来占着标题栏的第 6、7 个按钮（设置、置顶）中被挤下来的设置项，
+    以及被挤成「HBN ...」的设备型号。低频操作收进菜单是商业客户端的标准做法：
+    标题栏越干净，用户越容易一次点中他真正想要的那个。
+
+    置顶不再放这里：标题栏已经有常驻开关，菜单里再来一个只是重复。
+  -->
+  <div id="moreMenu">
+    <div class="mhead"><span>设备</span><span class="mhint" id="devSpec">—</span></div>
+    <div class="mhead" style="padding-top:0">
+      <span id="devName" style="text-transform:none;letter-spacing:0;font-size:11.5px;font-weight:600;color:rgba(233,235,242,.72)">未连接</span>
+    </div>
+    <div class="msep"></div>
+    <div class="mitem" id="btnPanel" title="设置（透明度 / 缩放）">
+      <svg viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="3"/>
+        <path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M19.1 4.9L17 7M7 17l-2.1 2.1"/>
+      </svg>
+      <span>设置</span>
+      <span class="mstate">透明度 / 缩放</span>
+    </div>
+    <div class="msep"></div>
+    <div class="mhead"><span>音频</span><span class="mhint" id="audioState">——</span></div>
+    <div class="mhead"><span>快捷键</span><span class="mhint">Ctrl 1-4 切档位</span></div>
+  </div>
+
+  <div id="ghost">360 × 640</div>
+</div>
+
+<script>
+const root = document.documentElement
+const $ = id => document.getElementById(id)
+const canvas = $('video')
+const ctx = canvas.getContext('2d', { alpha: false })
+const placeholder = $('placeholder')
+const dot = $('dot')
+const titleEl = $('title')
+const metaEl = $('meta')
+const ghost = $('ghost')
+
+let state = { contentOp: 1, bgOp: 1, ratioLock: true, pinned: false }
+let liveSize = { w: 360, h: 640 }
+
+/* ============ 双透明度 ============ */
+/**
+ * @param {boolean} persist 是否把值写回主进程存盘。
+ *
+ * 初始化期间必须传 false：那时 API 还没返回真实状态，
+ * 把默认值（或残留值）写回去会污染配置，导致下次启动
+ * 透明度莫名其妙变成 16% 这种数字。
+ */
+function paintOpacity (persist) {
+  root.style.setProperty('--content-op', state.contentOp)
+  root.style.setProperty('--bg-op', state.bgOp)
+  $('slContent').style.setProperty('--v', state.contentOp)
+  $('slBg').style.setProperty('--v', state.bgOp)
+  $('vContent').textContent = Math.round(state.contentOp * 100) + '%'
+  $('vBg').textContent = Math.round(state.bgOp * 100) + '%'
+  if (persist !== false) {
+    window.api.setOpacity({ content: state.contentOp, bg: state.bgOp })
+  }
+}
+
+function bindSlider (el, key) {
+  const set = e => {
+    const r = el.getBoundingClientRect()
+    let v = (e.clientX - r.left) / r.width
+    v = Math.min(1, Math.max(0, v))
+    state[key] = Math.round(v * 100) / 100
+    paintOpacity()
+  }
+  el.addEventListener('pointerdown', e => {
+    el.setPointerCapture(e.pointerId)
+    /** 拖动中加 .drag：滑块放大一圈 + 光晕，让「我正在调它」有明确反馈 */
+    el.classList.add('drag')
+    /* 用「按下点」作为起点，但先不设值 —— 只有真的移动了才改。
+       否则窗口出现在鼠标下方时会立刻被设成该位置对应的百分比
+       （实测被误设成 9%），用户看着像「一启动就半透明」。 */
+    const startX = e.clientX
+    const startY = e.clientY
+    let moved = false
+    const move = ev => {
+      if (!moved) {
+        if (Math.abs(ev.clientX - startX) < 3 && Math.abs(ev.clientY - startY) < 3) return
+        moved = true
+      }
+      set(ev)
+    }
+    const up = ev => {
+      // 没拖动过 = 单击，这时候才按点击位置设值
+      if (!moved) set(ev)
+      el.classList.remove('drag')
+      el.removeEventListener('pointermove', move)
+      el.removeEventListener('pointerup', up)
+      el.removeEventListener('pointercancel', up)
+    }
+    el.addEventListener('pointermove', move)
+    el.addEventListener('pointerup', up)
+    el.addEventListener('pointercancel', up)
+  })
+}
+bindSlider($('slContent'), 'contentOp')
+bindSlider($('slBg'), 'bgOp')
+
+/* ============ 拖动 / 缩放 ============ */
+/**
+ * 拖动标题栏。
+ *
+ * 这里为什么用 pointer capture：
+ *
+ * 原来是把 pointermove / pointerup 绑在 window 上。窗口只有 360×640，
+ * 一旦拖快了、指针跑到窗口外面，pointermove 就断流 ——
+ * 表现是「拖着拖着窗口不跟手了」，甚至松手后窗口卡在半路，
+ * 因为 pointerup 也收不到，drag 状态一直是活的。
+ *
+ * setPointerCapture 让元素在指针跑出窗口后仍然收到事件，
+ * 这是 W3C 为拖拽场景专门提供的机制。配合 lostpointercapture 兜底收尾。
+ */
+/**
+ * 标题栏拖动：整条 bar 任意位置按下都能拖，压在图标按钮上也算。
+ *
+ * 两条判定：
+ *   位移 ≥ 4px  → 进入拖动，走完 dragStart / dragMove / dragEnd
+ *   位移 < 4px  → 松开就是普通点击，按钮（置顶 / 音量 / 更多 / 清晰度）照常工作
+ *
+ * 为什么先判阈值再 dragStart：pointerdown 就直接拖的话，「点图标」会先产生
+ * 1~2px 的抖动位移，全部被当成拖拽吞掉，按钮永远点不动。阈值把两者分开。
+ *
+ * 为什么阈值处才 setPointerCapture：窗口只有 360×640，拖快一点指针就出界，
+ * 没有 capture 的话 pointermove 断流、窗口拖到一半卡住、松手也收不到 pointerup
+ * （原来的实现就栽在这里）。capture 让事件继续送到 #bar。
+ *
+ * 拖动结束后浏览器往往还会补一个 click（pointerdown/up 同元素时）——
+ * 必须吞掉，否则「拖完窗口顺手把按钮点了」。
+ */
+const DRAG_THRESHOLD = 4
+let suppressClickUntil = 0
+
+document.addEventListener('click', e => {
+  if (performance.now() < suppressClickUntil) {
+    e.stopPropagation()
+    e.preventDefault()
+  }
+}, true)
+
+$('bar').addEventListener('pointerdown', e => {
+  if (e.button !== 0) return
+
+  const bar = e.currentTarget
+  const startX = e.clientX
+  const startY = e.clientY
+  let dragging = false
+  let ended = false
+
+  const beginDrag = () => {
+    dragging = true
+    document.body.classList.add('bar-dragging')
+    try { bar.setPointerCapture(e.pointerId) } catch {}
+    window.api.dragStart()
+  }
+
+  const move = ev => {
+    if (ended) return
+    if (!dragging) {
+      if (Math.abs(ev.clientX - startX) < DRAG_THRESHOLD &&
+          Math.abs(ev.clientY - startY) < DRAG_THRESHOLD) return
+      beginDrag()
+    }
+    window.api.dragMove()
+  }
+
+  const finish = () => {
+    if (ended) return
+    ended = true
+    document.removeEventListener('pointermove', move, true)
+    document.removeEventListener('pointerup', finish, true)
+    document.removeEventListener('pointercancel', finish, true)
+    document.removeEventListener('lostpointercapture', finish, true)
+    document.body.classList.remove('bar-dragging')
+    if (dragging) {
+      /* 300ms 覆盖紧随 pointerup 的那次 click，又不会误伤之后的真实点击 */
+      suppressClickUntil = performance.now() + 300
+      window.api.dragEnd()
+    }
+    try { bar.releasePointerCapture(e.pointerId) } catch {}
+  }
+
+  /* 监听挂在 document 捕获阶段，而不是 #bar 上：
+     快速甩动时一次 pointermove 就可能直接跳到 bar 外面（bar 只有 46px 高），
+     事件目标变成画布/面板，挂在 bar 上的监听就永远收不到这一下，
+     阈值判定失效 —— 表现为「快速一甩，窗口纹丝不动」。 */
+  document.addEventListener('pointermove', move, true)
+  document.addEventListener('pointerup', finish, true)
+  document.addEventListener('pointercancel', finish, true)
+  document.addEventListener('lostpointercapture', finish, true)
+})
+
+/**
+ * 缩放把手。
+ *
+ * 和拖动同样的坑：事件绑在 window 上，指针拖出窗口就断流，
+ * 缩放卡在中间状态。这里同样用 pointer capture。
+ *
+ * 另外多个把手共用 body 的 rz-active 类，所以收尾要幂等 ——
+ * pointerup 和 lostpointercapture 可能先后都触发一次。
+ */
+document.querySelectorAll('.rz').forEach(el => {
+  el.addEventListener('pointerdown', e => {
+    e.preventDefault(); e.stopPropagation()
+
+    try { el.setPointerCapture(e.pointerId) } catch {}
+
+    document.body.classList.add('rz-active')
+    window.api.resizeStart(el.dataset.dir)
+
+    let ended = false
+    const finish = () => {
+      if (ended) return
+      ended = true
+      document.body.classList.remove('rz-active')
+      window.api.resizeEnd()
+      try { el.releasePointerCapture(e.pointerId) } catch {}
+      el.removeEventListener('pointermove', move)
+      el.removeEventListener('pointerup', finish)
+      el.removeEventListener('pointercancel', finish)
+    }
+    const move = () => {
+      if (ended) return
+      window.api.resizeMove()
+    }
+
+    el.addEventListener('pointermove', move)
+    el.addEventListener('pointerup', finish)
+    el.addEventListener('pointercancel', finish)
+    el.addEventListener('lostpointercapture', finish, { once: true })
+  })
+})
+
+/**
+ * 响应式档位 —— 必须按**窗口宽度**判定，不能按视频分辨率。
+ *
+ * 踩过的坑（这次是重构顶部栏时暴露的）：
+ *   原来 `const tier = liveSize.w < 300 ? ...`，而 liveSize 是**视频像素宽**
+ *   （476、564、720…）。也就是说不管窗口被拖到多窄，tier 永远是 lg ——
+ *   紧凑规则一条都不生效，窄窗下工具栏直接横向溢出，
+ *   最右边的关闭按钮被推到可视区外面，用户根本点不到。
+ *
+ * 正确信号是 window.innerWidth：它才是「有多少地方可以摆按钮」。
+ */
+function computeTier () {
+  /**
+   * 用 documentElement.clientWidth 而不是 window.innerWidth：
+   * 前者是「真正可以摆东西的宽度」（不含滚动条），
+   * 而且在 Electron 里窗口被程序改尺寸时它总是最新的。
+   */
+  const w = document.documentElement.clientWidth || window.innerWidth
+  if (w < 200) return 'xxs'
+  if (w < 260) return 'xs'
+  if (w < 320) return 'sm'
+  if (w < 380) return 'md'
+  return 'lg'
+}
+
+function renderSize () {
+  /**
+   * 注意：这里**不能**再写 metaEl。
+   * metaEl 现在是「实时帧率」，由 status 每秒刷新；
+   * 尺寸变化时如果写进去，帧率会变成「720×1600」直到下一秒被覆盖 —— 闪一下就没了。
+   * 窗口尺寸只决定响应式档位，外加角落那个拖动提示（#ghost）。
+   */
+  ghost.textContent = liveSize.w + ' × ' + liveSize.h
+  const tier = computeTier()
+  if (document.body.dataset.size !== tier) document.body.dataset.size = tier
+}
+window.api.onSize(d => { liveSize = d; renderSize() })
+
+/** 窗口被拖动缩放时要重新判定档位 —— 这条以前是缺的 */
+window.addEventListener('resize', renderSize)
+if (window.ResizeObserver) {
+  new ResizeObserver(() => renderSize()).observe(document.documentElement)
+}
+
+/* ============ 状态 / 日志 ============ */
+function setDot (cls) { dot.className = cls || '' }
+
+window.api.onStatus(s => {
+  /**
+   * ══════════ 息屏 / 亮屏跟随 ══════════
+   *
+   * 手机息屏时画面会停在最后一帧。这里盖一层半透明遮罩 + 一句说明，
+   * 而不是把画面清空 —— 用户能看出来「还在投，只是手机睡了」。
+   *
+   * 亮屏时后台会推 phoneAsleep:false，遮罩 220ms 淡出，
+   * 画面直接接上（采集一直没停，所以是「跟上」而不是「重连」）。
+   */
+  /**
+   * ══════════ 切档位提示 ══════════
+   * 主进程在 quality:set 里推 {switching:{name}} / {switching:null}，
+   * 放在 finally 里清除，异常也不会留下一个永远转圈的遮罩。
+   */
+  /**
+   * ══════════ 音频状态（显示在「更多」菜单里）══════════
+   *
+   * 主进程每秒把 AudioHealer 的探测结果并进 stats 一起推。
+   * 这样「画面在跑但电脑没声音」时，用户能一眼区分
+   * 「音频没连上」和「我电脑自己静音了」。
+   */
+  if (typeof s.audioConnected === 'boolean') {
+    const a = $('audioState')
+    if (a) {
+      a.textContent = s.audioConnected ? '已连接' : '未连接'
+      a.style.color = s.audioConnected
+        ? 'rgba(95,211,148,.85)'
+        : 'rgba(255,170,120,.75)'
+    }
+  }
+  if ('switching' in s) {
+    const m = $('switchMask')
+    if (m) {
+      m.classList.toggle('on', !!s.switching)
+      if (s.switching && s.switching.name) {
+        const n = $('switchName')
+        if (n) n.textContent = s.switching.name
+      }
+    }
+  }
+  if (typeof s.phoneAsleep === 'boolean') {
+    const mask = $('sleepMask')
+    if (mask) mask.classList.toggle('on', s.phoneAsleep)
+    if (s.phoneAsleep) {
+      setDot('wait')
+      titleEl.textContent = '手机息屏'
+    } else {
+      /**
+       * 亮屏就无条件恢复标题。
+       *
+       * 不要写成「有帧才恢复」—— 亮屏瞬间帧还没到，
+       * 那个条件会把标题永远钉在「手机息屏」上（实测踩过）。
+       */
+      setDot('live')
+      titleEl.textContent = '投屏中'
+    }
+  }
+  if (s.phase === 'connecting' || s.phase === 'preparing') {
+    setDot('wait')
+    titleEl.textContent = '连接中…'
+    /**
+     * 等待期间把主进程的原因显示到占位层。
+     *
+     * 以前失败/等待只在标题栏改一个「连接失败」，画面中央还是那句
+     * 「等待画面」—— 用户根本不知道卡在哪。等待手机上线可能长达
+     * 三分钟，必须把「在等什么、需要做什么」摆到画面正中间。
+     */
+    if (s.hint) {
+      placeholder.style.display = 'flex'
+      $('phTitle').textContent = '正在连接手机…'
+      $('phBody').textContent = s.hint
+    }
+  }
+  if (s.phase === 'error') {
+    setDot('err')
+    titleEl.textContent = '连接失败'
+    placeholder.style.display = 'flex'
+    $('phTitle').textContent = '连接失败'
+    $('phBody').textContent = s.error || s.hint || '手机没有响应'
+  }
+  if (s.streaming) { setDot('live'); titleEl.textContent = '投屏中' }
+  /**
+   * 设备型号不再往标题栏塞 —— 411px 宽会被压成「HBN ...」，
+   * 既占位置又没信息量。挪进「更多」菜单的头部，那里宽度管够。
+   */
+  if (s.device) {
+    const nm = (s.device.model || s.device.serial) +
+      (s.device.transport === 'wifi' ? ' · WiFi' : ' · USB')
+    const dn = $('devName')
+    if (dn) dn.textContent = nm
+    state.deviceName = nm
+  }
+  if (s.codec || s.videoSize) {
+    const parts = []
+    if (s.codec) parts.push(s.codec.toUpperCase())
+    if (s.videoSize) parts.push(s.videoSize.w + '×' + s.videoSize.h)
+    state.codecInfo = parts.join(' ')
+    const ds = $('devSpec')
+    if (ds && state.codecInfo) ds.textContent = state.codecInfo
+  }
+  if (s.stats) {
+    state.stats = s.stats
+    /**
+     * 标题栏只留帧率。
+     *
+     * 商业客户端的工具栏上，每一个字符都要能换来「用户多懂一点」——
+     * 「AVC1 720×1600 · 47 fps」里只有 47 fps 是随时会变的、
+     * 用户真正在意的（卡不卡）。编码器和分辨率属于诊断信息，
+     * 塞进「更多」菜单就够了，主栏位保持干净。
+     *
+     * 帧率低于 20 标黄：用户不用理解数字，看颜色就知道卡了。
+     */
+    const fps = Math.round(s.stats.fps || 0)
+    metaEl.textContent = fps > 0 ? fps + ' fps' : '-- fps'
+    metaEl.style.color = fps > 0 && fps < 20 ? 'rgba(255,180,120,.95)' : ''
+    if (s.stats.frames > 0) { placeholder.style.display = 'none'; setDot('live') }
+  }
+  if (s.streaming === false && !s.phase) {
+    setDot('')
+    if (!state.stats || !state.stats.frames) { titleEl.textContent = '待连接'; placeholder.style.display = 'flex' }
+  }
+})
+
+/**
+ * 主进程日志 —— 只输出到控制台。
+ * 界面上不再有日志面板，排查时开 DevTools 看。
+ * 错误级别额外把状态点变红，这比弹面板打扰用户好。
+ */
+window.api.onLog(l => {
+  const fn = l.level === 'error' ? console.error : l.level === 'warn' ? console.warn : console.log
+  fn('[miniwin][' + l.level + '] ' + l.msg)
+  if (l.level === 'error') setDot('err')
+})
+
+/* ============ WebCodecs 解码 ============ */
+let decoder = null
+let configuredFor = null
+let descBytes = null          // AVCDecoderConfigurationRecord
+let framesDecoded = 0
+let framesQueued = 0
+let framesDropped = 0
+/**
+ * 解码队列上限。
+ *
+ * 为什么不是写死一个数：60fps 下 12 帧只有 0.2 秒，任何一次解码
+ * 抖动都会撞上限；而撞上限就要丢帧，一丢就要等 IDR（最多 2 秒），
+ * 观感是「定时定格一下」。
+ *
+ * 按帧率算，取 0.5 秒的深度作为梯级背压（比主进程的 0.8 秒略紧，
+ * 因为解码器总是比采集端吃得慢）：
+ *   30fps → 15 帧
+ *   60fps → 30 帧
+ */
+function maxQueueDepth () {
+  const f = 60   // 采集端固定 60fps；改 fps 时这里跟着改即可
+  return Math.max(15, Math.min(45, Math.round(f * 0.5)))
+}
+const MAX_QUEUE = maxQueueDepth()
+/**
+ * 「只等关键帧」状态。
+ *
+ * 一旦因为积压丢过 delta 帧，参考链就断了，后面所有 P 帧解出来都是
+ * 错的（实测就是上半屏清楚、下半屏花掉并持续扩散）。
+ * 置 true 之后 delta 帧全部丢弃，直到收到 IDR 才恢复。
+ */
+let needKeyframe = false
+
+/**
+ * 解码器看门狗用到的状态。
+ *
+ * lastOutputAt 记录最后一次「真正解出画面」的时间。
+ * 如果连续 3 秒没有任何输出，说明解码器已经静默卡死 ——
+ * WebCodecs 在某些情况下不会触发 error 回调，只是再也不出帧，
+ * 界面上表现为画面定格、帧数不再增长，而外面一切正常。
+ */
+let lastOutputAt = 0
+let currentConfig = null
+let watchdogTimer = null
+
+function destroyDecoder () {
+  if (decoder) {
+    try { decoder.close() } catch {}
+    decoder = null
+  }
+  configuredFor = null
+  /**
+   * 解码器没了，「等关键帧」的标记也要清掉。
+   *
+   * 否则：丢帧 → needKeyframe=true → 正好这时候分辨率变了/看门狗
+   * 重建解码器 → 新解码器从 IDR 开始本来能直接解，却因为标记还是
+   * true 把所有帧都丢掉，画面永久黑屏，只能手动重开。
+   */
+  needKeyframe = false
+  framesQueued = 0
+}
+
+/**
+ * 从 AVCDecoderConfigurationRecord 里解析 SPS，取出真实画面尺寸。
+ *
+ * 结构：1字节版本 + 1字节 profile + 1字节兼容 + 1字节 level +
+ *       1字节(低2位=lengthSizeMinusOne) + 1字节(低5位=numSPS) +
+ *       每个 SPS：2字节长度 + NAL 数据 + ...最后 1字节 numPPS ...
+ *
+ * SPS 里的尺寸用指数哥伦布编码，这里只解到 width/height 为止。
+ */
+function parseSpsSize (desc) {
+  try {
+    const b = desc instanceof Uint8Array ? desc : new Uint8Array(desc)
+    if (b.length < 8) return null
+    const numSps = b[5] & 0x1f
+    if (numSps < 1) return null
+    const spsLen = (b[6] << 8) | b[7]
+    if (spsLen < 4 || 8 + spsLen > b.length) return null
+    const sps = b.subarray(8, 8 + spsLen)
+    // sps[0] 是 NAL header，从 sps[1] 开始是 profile_idc 等
+    if ((sps[0] & 0x1f) !== 7) return null
+    return readSpsDimension(sps)
+  } catch {
+    return null
+  }
+}
+
+/** 指数哥伦布解 bitstream，只读到 frame_mbs_only_flag 和宽高 */
+function readSpsDimension (sps) {
+  let pos = 8   // 跳过 1 字节 NAL header（已在 sps[0]），从 bit 8 开始
+  const bits = []
+  const getBit = () => {
+    const byte = sps[pos >> 3]
+    if (byte === undefined) return 0
+    const bit = (byte >> (7 - (pos & 7))) & 1
+    pos++
+    return bit
+  }
+  const skipBits = n => { pos += n }
+  const readBits = n => {
+    let v = 0
+    for (let i = 0; i < n; i++) v = (v << 1) | getBit()
+    return v
+  }
+  const readUE = () => {
+    let zeros = 0
+    while (getBit() === 0 && zeros < 32) zeros++
+    if (zeros === 0) return 0
+    return (1 << zeros) - 1 + readBits(zeros)
+  }
+  const readSE = () => {
+    const ue = readUE()
+    return (ue & 1) ? (ue + 1) / 2 : -(ue / 2)
+  }
+
+  // profile_idc (8) + constraint flags (8) + level_idc (8)
+  const profileIdc = readBits(8)
+  skipBits(16)
+  readUE()                        // seq_parameter_set_id
+
+  const HIGH = [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135]
+  if (HIGH.includes(profileIdc)) {
+    const chromaFormat = readUE()
+    if (chromaFormat === 3) skipBits(1)      // separate_colour_plane_flag
+    readUE()                                  // bit_depth_luma_minus8
+    readUE()                                  // bit_depth_chroma_minus8
+    skipBits(1)                               // qpprime_y_zero_transform_bypass_flag
+    if (getBit()) {                           // seq_scaling_matrix_present_flag
+      const n = chromaFormat !== 3 ? 8 : 12
+      for (let i = 0; i < n; i++) {
+        if (getBit()) {
+          const size = i < 6 ? 16 : 64
+          let last = 8, next = 8
+          for (let j = 0; j < size; j++) {
+            if (next !== 0) next = (last + readSE() + 256) % 256
+            last = next === 0 ? last : next
+          }
+        }
+      }
+    }
+  }
+
+  readUE()                        // log2_max_frame_num_minus4
+  const pocType = readUE()
+  if (pocType === 0) {
+    readUE()                      // log2_max_pic_order_cnt_lsb_minus4
+  } else if (pocType === 1) {
+    skipBits(1)                   // delta_pic_order_always_zero_flag
+    readSE()                      // offset_for_non_ref_pic
+    readSE()                      // offset_for_top_to_bottom_field
+    const n = readUE()
+    for (let i = 0; i < n && i < 256; i++) readSE()
+  }
+
+  readUE()                        // max_num_ref_frames
+  skipBits(1)                     // gaps_in_frame_num_value_allowed_flag
+  const picWidthInMbs = readUE() + 1
+  const picHeightInMapUnits = readUE() + 1
+  const frameMbsOnly = getBit()   // frame_mbs_only_flag
+  if (!frameMbsOnly) skipBits(1)  // mb_adaptive_frame_field_flag
+  skipBits(1)                     // direct_8x8_inference_flag
+
+  let cropL = 0, cropR = 0, cropT = 0, cropB = 0
+  if (getBit()) {                 // frame_cropping_flag
+    cropL = readUE()
+    cropR = readUE()
+    cropT = readUE()
+    cropB = readUE()
+  }
+
+  // 从 SPS 头部读 chroma_format_idc（高 profile 才有，默认 1）
+  const chromaArrayType = HIGH.includes(profileIdc) ? 1 : 1
+  const subWidthC = chromaArrayType === 3 ? 1 : 2
+  const subHeightC = chromaArrayType === 1 ? 2 : 1
+
+  const width = picWidthInMbs * 16 - (cropL + cropR) * subWidthC
+  const height = (2 - frameMbsOnly) * picHeightInMapUnits * 16 - (cropT + cropB) * subHeightC
+
+  if (!(width > 0 && height > 0 && width < 10000 && height < 10000)) return null
+  return { w: width, h: height }
+}
+
+function ensureDecoder (codecString, w, h, descBytesOverride) {
+  if (!codecString) return false
+  if (decoder && configuredFor === codecString) return true
+
+  destroyDecoder()
+  if (typeof VideoDecoder === 'undefined') {
+    addLocalLog('error', '当前环境不支持 WebCodecs VideoDecoder')
+    return false
+  }
+  // WiFi 模式显式传入 description；scrcpy 模式用全局 descBytes
+  if (descBytesOverride) descBytes = descBytesOverride
+
+  decoder = new VideoDecoder({
+    output: frame => {
+      framesDecoded++
+      framesQueued = Math.max(0, framesQueued - 1)
+      lastOutputAt = Date.now()      // 看门狗据此判断解码器是否还活着
+      drawFrame(frame)
+      frame.close()
+      if (framesDecoded === 1) {
+        placeholder.style.display = 'none'
+        addLocalLog('ok', '首帧解码完成，画面已显示')
+      }
+    },
+    error: e => {
+      addLocalLog('error', '解码器错误: ' + e.message)
+    }
+  })
+
+  // AVC 需要 description（AVCDecoderConfigurationRecord），否则 configure 成功但解码报错
+  /**
+   * codedWidth/codedHeight 必须和 SPS 里声明的一致，否则 H.264 解码器
+   * 会在第 2 帧报 `Decoding error`（第 1 帧 IDR 能过，因为参数集刚下发）。
+   *
+   * 踩过的坑：这里用 state.videoSize，但 status 消息可能还没到（时序竞争），
+   * 于是拿到默认值 1080×2400，而实际视频是 476×1080 → 第一帧成功、第二帧崩。
+   *
+   * 正确做法：优先从 description（AVCDecoderConfigurationRecord）里解析 SPS
+   * 拿真实尺寸；解析不出来再用传入值兜底。
+   */
+  const fromSps = descBytes ? parseSpsSize(descBytes) : null
+  const cw = (fromSps && fromSps.w) || w || 1080
+  const ch = (fromSps && fromSps.h) || h || 2400
+
+  const base = {
+    codec: codecString,
+    codedWidth: cw,
+    codedHeight: ch,
+    optimizeForLatency: true
+  }
+  if (descBytes) base.description = descBytes
+
+  const tries = [
+    { ...base, hardwareAcceleration: 'prefer-hardware', mode: 'hw' },
+    { ...base, mode: 'sw' }
+  ]
+  for (const cfg of tries) {
+    const mode = cfg.mode
+    delete cfg.mode
+    try {
+      decoder.configure(cfg)
+      configuredFor = codecString
+      // 存一份配置：reset() 之后要重新 configure，需要原始参数
+      currentConfig = cfg
+      lastOutputAt = Date.now()
+      addLocalLog('ok', `解码器已配置: ${codecString} ${cw}×${ch} · ${mode}${descBytes ? ' · 带 description' : ''}${fromSps ? ' · 尺寸来自SPS' : ''}`)
+      return true
+    } catch (e) {
+      addLocalLog('warn', `configure(${mode}) 失败: ${e.message}`)
+    }
+  }
+  destroyDecoder()
+  addLocalLog('error', '解码器配置失败')
+  return false
+}
+
+/**
+ * 最近一帧的视频像素尺寸。
+ * 面板展开/收起后要用它重算窗口大小，所以必须记住。
+ */
+let lastFrameW = 0
+let lastFrameH = 0
+
+function drawFrame (frame) {
+  const W = frame.displayWidth || frame.codedWidth
+  const H = frame.displayHeight || frame.codedHeight
+  lastFrameW = W
+  lastFrameH = H
+  if (canvas.width !== W || canvas.height !== H) {
+    canvas.width = W
+    canvas.height = H
+    requestWindowFit(W, H)
+    // 分辨率变了，画布显示尺寸要重算
+    requestAnimationFrame(fitCanvas)
+  }
+  // 第一帧画上来才显示（默认 display:none，避免空画布露出白块）
+  if (canvas.style.display === 'none') canvas.style.display = 'block'
+  /**
+   * ══════════ 有画面 → 占位层必须立刻撤 ══════════
+   *
+   * 踩过的坑（用户原话：「画面都投过去了 怎么还显示正在连接手机」）：
+   *
+   * 占位层原来只在 `status` 回调里、且 `s.stats.frames > 0` 时才隐藏。
+   * 这条路太窄：
+   *   · 页面重载后主进程补推的 status 里没带 stats → 永远不隐藏
+   *   · 断线重连后 stats 只在每秒一次的 tick 里发 → 最多多挂 1 秒
+   *   · 任何一次 status 丢失（窗口失焦、IPC 抖动）都会让它永久留在屏幕上
+   *
+   * 画面是最终事实：只要真的画出一帧，就把占位层撤掉。
+   */
+  if (placeholder.style.display !== 'none') placeholder.style.display = 'none'
+  /**
+   * 高质量缩放提示：告诉浏览器这次 drawImage 要平滑处理。
+   * 1080p 源画进 1080 宽的 canvas 是 1:1（无缩放），
+   * 真正的缩放发生在这之后的 CSS 显示阶段 —— 那里由
+   * image-rendering:high-quality 接管。
+   */
+  ctx.imageSmoothingEnabled = true
+  ctx.imageSmoothingQuality = 'high'
+  ctx.drawImage(frame, 0, 0, W, H)
+}
+
+/**
+ * 把画布的显示尺寸算成「塞进舞台的最大等比尺寸」。
+ *
+ * ── 为什么必须用 JS 算 ──
+ *
+ * CSS 能做到「不超框」（max-width/max-height + object-fit:contain），
+ * 但做不到「按比例放大到刚好贴边」——
+ *   width:auto  → 用画布的固有像素宽（319），不会放大
+ *   width:100%  → 撑满，但 height 也要给值，否则高度不跟着算
+ *   min(100%, calc(...)) → 里面那个比例是运行时值，CSS 里拿不到
+ *
+ * 所以这里直接量舞台盒，取「按宽贴边」和「按高贴边」里小的那个。
+ * 结果精确到像素，不会留任何多余空白。
+ *
+ * 触发时机：
+ *   - 首帧（分辨率已知）
+ *   - 窗口尺寸变化（用户拖边、主进程贴合）
+ *   - 面板展开/收起
+ */
+function fitCanvas () {
+  if (!lastFrameW || !lastFrameH) return
+  const stage = $('stage')
+  if (!stage) return
+  const r = stage.getBoundingClientRect()
+  if (!r.width || !r.height) return
+
+  const scale = Math.min(r.width / lastFrameW, r.height / lastFrameH)
+  const w = Math.max(1, Math.round(lastFrameW * scale))
+  const h = Math.max(1, Math.round(lastFrameH * scale))
+
+  /**
+   * 把这次「为什么是这个尺寸」记下来。
+   *
+   * 画布尺寸和黑边的关系只能靠这几个数判断，光看截图会误判 ——
+   * 之前我按窗口 404×921 和手机 0.443 推算，结论和实测差了 20%，
+   * 就是因为没看视频帧的真实像素尺寸。
+   */
+  addLocalLog('info',
+    `画布 ${w}×${h}（帧 ${lastFrameW}×${lastFrameH} ${(lastFrameW / lastFrameH).toFixed(4)}` +
+    ` · 舞台 ${Math.round(r.width)}×${Math.round(r.height)} ${(r.width / r.height).toFixed(4)}` +
+    ` · 缩放 ${scale.toFixed(3)}）`)
+
+  // 只在真的变了才写，避免每帧都触发样式重算
+  if (canvas._fitW === w && canvas._fitH === h) return
+  canvas._fitW = w
+  canvas._fitH = h
+  canvas.style.width = w + 'px'
+  canvas.style.height = h + 'px'
+}
+
+// 窗口尺寸一变就重算（Electron 的 resize 会连发多次，用 rAF 合并）
+let fitRaf = 0
+window.addEventListener('resize', () => {
+  if (fitRaf) return
+  fitRaf = requestAnimationFrame(() => { fitRaf = 0; fitCanvas() })
+})
+
+/**
+ * 让窗口贴合视频比例。
+ *
+ * 难点：窗口里除了视频还有标题栏和控制面板，而它们的高度**随窗口宽度变**
+ * （窄窗是紧凑布局，面板更矮）。写死一个 CHROME_H 必然对不准 ——
+ * 实测 223px 宽时是 42+98=140，但我一开始按 134 算，底部就被切掉 6px。
+ *
+ * 所以这里直接量真实 DOM 高度，把「视频区该有多大」精确告诉主进程。
+ * 只在分辨率首次出现时触发一次。
+ */
+/**
+ * 把「宽度/高度 + 上下 chrome 的高度」告诉主进程，让它重算窗口尺寸。
+ *
+ * chrome 只算标题栏 —— 设置面板是绝对定位的浮层，不占布局，
+ * 但 getBoundingClientRect() 依然会返回它的渲染高度（实测 103px）。
+ * 之前把它算进 chrome 里，主进程就以为窗口要更高，
+ * 于是窗口被撑到 958 高，视频区跟着变大，画面被拉长。
+ *
+ * 所以这里只量 bar，绝不量 panel。
+ */
+let fitTimer = null
+function requestWindowFit (W, H) {
+  clearTimeout(fitTimer)
+  fitTimer = setTimeout(() => {
+    requestAnimationFrame(() => {
+      const barH = $('bar').getBoundingClientRect().height
+      const chromeH = Math.round(barH)
+      if (window.api.videoResized) {
+        window.api.videoResized({ w: W, h: H, chromeH })
+      }
+    })
+  }, 60)
+}
+
+/* 主进程已经做过 Annex-B → AVCC 转换，这里直接喂 */
+function feedFrame (msg) {
+  const { data, pts, key } = msg
+  const codecString = msg.codecString || state.codecString
+
+  /**
+   * 暂停时丢弃帧但继续 ack。
+   *
+   * 为什么要 ack：主进程用「已发未确认」计数做背压，
+   * 不 ack 会很快卡在上限然后彻底停止发送（暂停后恢复不过来）。
+   *
+   * 为什么丢弃而不是缓存：暂停可能持续很久，缓存会吃光内存；
+   * 而且恢复时也不该补播暂停期间的画面 —— 直接从当前画面继续才对。
+   */
+  if (wifiPaused) {
+    if (window.api.ackFrame) window.api.ackFrame()
+    return
+  }
+
+  // 每一条入口都必须 ack，否则主进程的 inFlight 会只增不减，
+  // 很快就卡在上限开始丢帧（表现为画面冻结）。
+  // 用 done 标记保证只 ack 一次。
+  let acked = false
+  const done = () => {
+    if (acked) return
+    acked = true
+    if (window.api.ackFrame) window.api.ackFrame()
+  }
+
+  if (!codecString) {
+    addLocalLog('warn', '缺 codecString，丢弃帧')
+    done()
+    return
+  }
+  const w = state.videoSize ? state.videoSize.w : 1080
+  const h = state.videoSize ? state.videoSize.h : 2400
+
+  if (!ensureDecoder(codecString, w, h)) { done(); return }
+  if (!decoder || decoder.state !== 'configured') { done(); return }
+
+  /**
+   * 背压 —— 丢帧必须连带「等关键帧」，不能只丢一帧。
+   *
+   * ── 花屏的真凶 ──
+   *
+   * 原来写的是：
+   *     if (backlog > MAX_QUEUE && !key) { framesDropped++; return }
+   *
+   * 只丢当前这一帧 P，后面的 P 帧照常喂给解码器。但 H.264 的 P 帧
+   * 是差分编码，缺了参考帧之后解出来的就是**错误的残差叠加**——
+   * 现象是画面从某处开始腐烂并持续扩散，实测上半屏清楚、下半屏
+   * 全是色块，而且几十帧都不恢复。
+   *
+   * 正确做法：丢一帧就进入「只等 IDR」状态，期间所有 delta 帧
+   * 一律不进解码器。宁可停 1~2 秒画面定格，也不要一直花屏。
+   */
+  const backlog = decoder.decodeQueueSize || 0
+
+  if (needKeyframe) {
+    if (!key) {
+      framesDropped++
+      done()
+      return
+    }
+    // 拿到关键帧，解除等待
+    needKeyframe = false
+    addLocalLog('info', '已收到关键帧，恢复解码')
+  }
+
+  if (backlog > MAX_QUEUE && !key) {
+    framesDropped++
+    needKeyframe = true
+    addLocalLog('warn', `解码积压 ${backlog}，丢帧并等待关键帧重置参考链`)
+    done()
+    return
+  }
+
+  /**
+   * 积压太深时主动 reset。
+   *
+   * 到 30 帧还没消化，说明解码器已经跟不上了（弱机 / 分辨率突然变大）。
+   * 继续塞只会让延迟越滚越大，最后画面定格。
+   * reset 之后立刻退出，等下一帧关键帧重新配置 —— 因为是 IDR 所以能干净重建。
+   */
+  if (backlog > 30) {
+    try {
+      decoder.reset()
+      decoder.configure(currentConfig)
+      framesQueued = 0
+      /**
+       * reset 之后解码器是「干净但未喂过帧」的状态，按 H.264 规则
+       * 下一帧必须是 IDR。所以这里把 needKeyframe 置 true，
+       * 让后续 delta 帧先等着 —— 既避免立刻花屏，也避免把
+       * 一个非 IDR 帧硬塞进刚 configure 的解码器导致 closed。
+       */
+      needKeyframe = true
+      addLocalLog('warn', '解码积压 ' + backlog + '，已重置解码器（等关键帧）')
+    } catch (e) {
+      addLocalLog('error', '重置解码器失败: ' + e.message)
+    }
+    done()
+    return
+  }
+
+  const u8 = new Uint8Array(data)
+  const chunk = new EncodedVideoChunk({
+    type: key ? 'key' : 'delta',
+    timestamp: Math.round(pts),
+    data: u8
+  })
+
+  try {
+    decoder.decode(chunk)
+    framesQueued++
+  } catch (e) {
+    addLocalLog('error', 'decode 失败: ' + e.message)
+  }
+  // 已进解码器 → 主进程可以继续发下一帧
+  done()
+}
+
+/**
+ * 解码器看门狗。
+ *
+ * 每 2 秒检查一次：如果解码器处于 configured 状态、却已经连续 4 秒没有
+ * 吐出任何帧，就判定它卡死并重建。
+ *
+ * 为什么需要它：WebCodecs 的解码器在队列饱和 / 硬件单元异常时
+ * 常常**不报错也不出帧** —— error 回调不触发，state 还是 'configured'，
+ * 但画面就是不动了。这种静默僵死只能靠「多久没出帧」来判断。
+ *
+ * 重建时把 gotKey 置回 false，等下一个 IDR 再开始喂，
+ * 保证恢复后从干净状态起步，不会接着解半截 GOP。
+ */
+function startWatchdog () {
+  if (watchdogTimer) return
+  watchdogTimer = setInterval(() => {
+    if (!decoder || decoder.state !== 'configured') return
+    if (!lastOutputAt) return
+    const silentMs = Date.now() - lastOutputAt
+    if (silentMs > 4000) {
+      addLocalLog('warn', '解码器 ' + Math.round(silentMs / 1000) + ' 秒无输出，正在重建')
+      try {
+        const cfg = currentConfig
+        destroyDecoder()
+        framesQueued = 0
+        if (cfg && ensureDecoder(cfg.codec, cfg.codedWidth, cfg.codedHeight)) {
+          /**
+           * 重建成功后必须重新等 IDR。
+           *
+           * destroyDecoder() 会把 needKeyframe 清成 false（那是为了
+           * 「换分辨率时不要卡住」），但看门狗重建的场景不一样：
+           * 解码器刚从静默僵死里复活，下面立刻喂 delta 帧会直接
+           * 花屏或 closed。所以这里显式再置一次 true。
+           */
+          needKeyframe = true
+          addLocalLog('ok', '解码器已重建，等待关键帧')
+        }
+      } catch (e) {
+        addLocalLog('error', '重建解码器失败: ' + e.message)
+      }
+    }
+  }, 2000)
+}
+
+function stopWatchdog () {
+  if (watchdogTimer) { clearInterval(watchdogTimer); watchdogTimer = null }
+}
+
+function addLocalLog (level, msg) {
+  // 只写控制台：界面上不再展示日志，排查时用 DevTools 看
+  const fn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log
+  fn('[miniwin][' + level + '] ' + msg)
+}
+
+/* 主进程侧改了置顶（快捷键 Ctrl+Shift+F12 / 托盘菜单）时，把标题栏按钮同步过来。
+   没有这条，用户按了快捷键后按钮还亮着「已置顶」，下一次点击就会反着切。 */
+if (window.api.onPinned) {
+  window.api.onPinned(v => {
+    state.pinned = !!v
+    paintPin()
+  })
+}
+
+window.api.onConfig(cfg => {
+  // description 存起来，下次 ensureDecoder 时带上。
+  // 注意：不要在这里立刻 destroyDecoder——config 包常和后面的关键帧几乎同时到，
+  // 重建会打断正在解码的帧；只在 codecString 变化（真正的分辨率/参数切换）时才重建。
+  if (cfg.description) {
+    const src = new Uint8Array(cfg.description)
+    descBytes = new Uint8Array(src.length)
+    descBytes.set(src)
+  }
+
+  /**
+   * 分辨率必须在这里落地 —— scrcpy 采集路径依赖它。
+   *
+   * 旧路径靠 /meta 的 status 消息带 videoSize，但 scrcpy 路径
+   * 是从 mkv 里直接解出来的 AVCC 流，没有 meta 消息。不写这一句，
+   * feedFrame 会退回默认的 1080×2400，与真实 556×1260 不符 ——
+   * 解码器 configure 出来的帧尺寸错，解几帧后直接 closed
+   * （实测正好停在 61 帧）。
+   *
+   * 另外 width/height 可能为 0（mkv 头里没带），
+   * 这时从 SPS 里解析（descBytes 的 6.. 是 SPS）。
+   */
+  if (cfg.width > 0 && cfg.height > 0) {
+    state.videoSize = { w: cfg.width, h: cfg.height }
+  } else if (!state.videoSize) {
+    try {
+      const sz = parseSpsSize(descBytes)
+      if (sz) state.videoSize = { w: sz.w, h: sz.h }
+    } catch {}
+  }
+
+  const changed = state.codecString && state.codecString !== cfg.codecString
+  state.codecString = cfg.codecString
+
+  if (changed) {
+    destroyDecoder()
+    addLocalLog('warn', '编码参数变化，重建解码器: ' + cfg.codecString)
+  } else {
+    addLocalLog('ok', '收到 SPS/PPS: ' + cfg.codecString)
+  }
+})
+
+window.api.onFrame(msg => {
+  if (msg.codecString) state.codecString = msg.codecString
+  // structuredClone 传过来的是 Uint8Array
+  feedFrame(msg)
+})
+
+/* ============================================================
+ * 音频播放
+ * ------------------------------------------------------------
+ * 链路：手机 APK（AudioPlaybackCapture）→ AAC → TCP →
+ *       wifi-receiver → /audio → 主进程 audio-bridge →
+ *       IPC → 这里 → AudioDecoder → WebAudio
+ *
+ * ── 为什么不用 <audio> 标签 ──
+ *
+ * 收到的是裸 AAC 帧（raw AAC，没有 ADTS 头、没有容器），
+ * <audio> 无法播放。WebCodecs 的 AudioDecoder 正好吃这种输入。
+ *
+ * ── 时钟 ──
+ *
+ * 音频对时间敏感：早/晚 200ms 都能听出断续。解码出来的
+ * AudioData 带 timestamp，但「什么时候送扬声器」要自己排程。
+ *
+ * 这里用最稳的做法：每个 AudioBuffer 直接 schedule 到
+ * audioCtx.currentTime + 小缓冲，靠 Web Audio 自己的调度
+ * 保证连续。网络抖动靠「积压过多就丢最旧」吸收。
+ * ============================================================ */
+const AUDIO = {
+  ctx: null,
+  decoder: null,
+  desc: null,          // AudioSpecificConfig
+  gain: null,
+  ready: false,
+  frames: 0,
+  scheduled: 0,
+  dropped: 0,
+  /** 播放提前量：太小会断续，太大会有延迟。60ms 实测最平衡 */
+  LEAD: 0.08,
+  /** 允许的最大积压（秒），超过就丢弃 */
+  MAX_BACKLOG: 0.5
+}
+
+/**
+ * 建立音频解码器。
+ *
+ * description 是 AudioSpecificConfig（2~5 字节），
+ * 里面含 samplingRate 和 channelCount —— 用它算出正确的
+ * sampleRate，不能硬编码（手机可能是 44.1k 也可能是 48k）。
+ */
+function ensureAudioDecoder (desc) {
+  if (!desc || !desc.length) return false
+  if (AUDIO.decoder && AUDIO.decoder.state === 'configured' && AUDIO.desc) {
+    return true
+  }
+
+  try {
+    if (!AUDIO.ctx) {
+      AUDIO.ctx = new AudioContext({ latencyHint: 'interactive' })
+      AUDIO.gain = AUDIO.ctx.createGain()
+      AUDIO.gain.gain.value = 1
+      AUDIO.gain.connect(AUDIO.ctx.destination)
+    }
+    // 有些浏览器策略下 ctx 默认是 suspended，需要用户手势才能 resume。
+    // 窗口已经有交互（拖动/点击）时通常已经 running，这里兜底。
+    if (AUDIO.ctx.state === 'suspended') AUDIO.ctx.resume().catch(() => {})
+
+    const descU8 = new Uint8Array(desc)
+
+    /**
+     * 从 AudioSpecificConfig 解析采样率/声道数。
+     *
+     * 位布局（ISO 14496-3）：
+     *   [0:5]   audioObjectType
+     *   [5:9]   samplingFrequencyIndex
+     *   [9:13]  channelConfiguration
+     *
+     * samplingFrequencyIndex 表：
+     *   0:96000 1:88200 2:64000 3:48000 4:44100 5:32000
+     *   6:24000 7:22050 8:16000 9:12000 10:11025 11:8000
+     */
+    const RATES = [96000, 88200, 64000, 48000, 44100, 32000,
+                   24000, 22050, 16000, 12000, 11025, 8000]
+    const b0 = descU8[0]
+    const b1 = descU8.length > 1 ? descU8[1] : 0
+    const freqIdx = ((b0 & 0x07) << 1) | ((b1 & 0x80) >> 7)
+    const channels = (b1 & 0x78) >> 3
+    const sampleRate = RATES[freqIdx] || 44100
+    const ch = channels || 2
+
+    AUDIO.decoder = new AudioDecoder({
+      output: onAudioData,
+      error: (e) => {
+        addLocalLog('error', '音频解码错误: ' + (e && e.message))
+      }
+    })
+
+    AUDIO.decoder.configure({
+      codec: 'mp4a.40.2',       // AAC-LC
+      sampleRate,
+      numberOfChannels: ch,
+      description: descU8
+    })
+
+    AUDIO.desc = descU8
+    AUDIO.ready = true
+    addLocalLog('ok', `音频解码器就绪 ${sampleRate}Hz ${ch}ch`)
+    return true
+  } catch (e) {
+    addLocalLog('error', '音频初始化失败: ' + e.message)
+    return false
+  }
+}
+
+/**
+ * 解码出的一帧 PCM → 排程到 Web Audio。
+ *
+ * schedule 到 currentTime + LEAD，这样有 60ms 的排队空间，
+ * 网络抖动不会造成断音。如果积压超过 MAX_BACKLOG，
+ * 说明播放落后了，直接把这一帧丢掉（宁可少一帧也不要越来越延迟）。
+ */
+function onAudioData (audioData) {
+  try {
+    if (!AUDIO.ctx || !AUDIO.gain) { audioData.close(); return }
+
+    const ch = audioData.numberOfChannels
+    const n = audioData.numberOfFrames
+    if (!n) { audioData.close(); return }
+
+    const buf = AUDIO.ctx.createBuffer(ch, n, audioData.sampleRate)
+    for (let c = 0; c < ch; c++) {
+      const dst = buf.getChannelData(c)
+      audioData.copyTo(dst, { planeIndex: c, format: 'f32-planar' })
+    }
+    audioData.close()
+
+    const now = AUDIO.ctx.currentTime
+
+    /**
+     * AUDIO.scheduled 是「下一帧该播的时间点」。
+     *
+     * 坑：如果只做 `scheduled = when + duration` 累加，一旦出现一次
+     * 大跳跃（比如窗口被挂起、AudioContext 被暂停后恢复），
+     * scheduled 会跑到很远（实测飙到 1181s），之后每一帧都被
+     * 「积压太多」判定丢掉，声音就断了。
+     *
+     * 所以每次都要把 scheduled 钳制在合理范围内：
+     * 落后于 now（说明已经播完了）→ 重置到 now + LEAD
+     * 超前太多（异常跳跃）→ 也重置
+     */
+    if (AUDIO.scheduled < now || AUDIO.scheduled > now + AUDIO.MAX_BACKLOG) {
+      AUDIO.scheduled = now + AUDIO.LEAD
+    }
+
+    const when = Math.max(now + AUDIO.LEAD, AUDIO.scheduled)
+    const src = AUDIO.ctx.createBufferSource()
+    src.buffer = buf
+    src.connect(AUDIO.gain)
+    src.start(when)
+
+    AUDIO.scheduled = when + buf.duration
+    AUDIO.frames++
+  } catch (e) {
+    try { audioData.close() } catch {}
+  }
+}
+
+/* 收到解码器配置 */
+window.api.onAudioConfig(cfg => {
+  if (!cfg || !cfg.description) return
+  ensureAudioDecoder(cfg.description)
+})
+
+/* 收到音频帧 */
+window.api.onAudioFrame(msg => {
+  if (!msg || !msg.data) return
+  if (!AUDIO.ready) return   // 还没配置，丢弃
+  if (!AUDIO.decoder || AUDIO.decoder.state !== 'configured') return
+
+  try {
+    const u8 = new Uint8Array(msg.data)
+    const chunk = new EncodedAudioChunk({
+      type: 'key',           // AAC 每帧都可独立解码
+      timestamp: Math.round((msg.pts || 0) * 1000),   // ms → us
+      data: u8
+    })
+    AUDIO.decoder.decode(chunk)
+  } catch (e) {
+    // 单帧失败不影响后续
+  }
+})
+
+/* ============ 按钮 ============ */
+/**
+ * 设置面板开关。
+ *
+ * 面板现在是绝对定位的浮层，展开收起不影响布局，
+ * 所以不需要通知主进程重算窗口尺寸 —— 之前那样做反而会在收起瞬间
+ * 把窗口宽度改错，导致画面被裁。
+ *
+ * 点面板外面也能收起，这是浮层交互的常规约定。
+ */
+let panelOpen = false
+function setPanelOpen (on) {
+  panelOpen = !!on
+  $('panel').classList.toggle('open', panelOpen)
+  $('btnPanel').classList.toggle('on', panelOpen)
+  // 打开设置时收起音量弹层，避免两个浮层叠在一起
+  if (panelOpen) {
+    const vp = $('volPop')
+    if (vp) vp.classList.remove('open')
+    const bv = $('btnVol')
+    if (bv) bv.classList.remove('on')
+  }
+}
+$('btnPanel').addEventListener('click', e => {
+  e.stopPropagation()
+  setPanelOpen(!panelOpen)
+})
+
+/**
+ * 手机导航键：返回 / 桌面。
+ *
+ * 走 adb keyevent：
+ *   BACK = 4   回上一级
+ *   HOME = 3   回桌面
+ *
+ * 这两个值取自 android.view.KeyEvent，是稳定常量。
+ * 主进程的 ctl:key 会把它翻译成 `input keyevent 4` / `3`。
+ *
+ * 为什么不放进设置面板里：这是高频操作，藏一层会很难用。
+ */
+$('btnBack').addEventListener('click', () => window.api.ctlKey('KEYCODE_BACK'))
+$('btnHome').addEventListener('click', () => window.api.ctlKey('KEYCODE_HOME'))
+
+/**
+ * 置顶开关（标题栏，原「暂停」位）。
+ *
+ * 暂停按钮从标题栏撤掉了：低频，而且更多菜单 / 自动化里还有入口，
+ * 占着一格不划算；置顶是投屏时最常用的动作，提到标题栏常驻，
+ * 按钮亮起 = 已置顶，点一下切换。
+ *
+ * 两个入口共用 setPinned()：
+ *   1. 标题栏 #btnTop —— 唯一的可见入口（「更多」菜单里的置顶行已删）
+ *   2. 主进程快捷键 Ctrl+Shift+F12 —— 它改完会 send('pinned') 回来，
+ *      由下面的 onPinned 同步，否则 UI 会和真实状态脱节。
+ *
+ * 默认值在主进程：st.pinned = false（不置顶）。
+ */
+let wifiPaused = false   // 暂停按钮已移除；变量保留给拉流循环做丢帧判断
+
+function setPinned (on) {
+  state.pinned = !!on
+  paintPin()
+  window.api.setPin(state.pinned)
+  addLocalLog('info', state.pinned ? '已置顶' : '已取消置顶')
+}
+
+$('btnTop').addEventListener('click', () => setPinned(!state.pinned))
+
+/**
+ * 音量滑块。
+ *
+ * 竖向轨道，从底部往上算 —— 和真实音量推子一致。
+ * 用 pointer 事件而不是 click，这样按住拖动能连续调。
+ */
+const volPop = $('volPop')
+const volTrack = $('volTrack')
+
+function paintVol (v) {
+  /*
+    变量必须设在 #volTrack 上 —— #volFill 和 #volKnob 是它的子元素，
+    靠 CSS 继承拿 var(--v)。之前设在 parentElement（#volPop）上，
+    虽然也能通过继承生效，但只要中间有任何元素重设了 --v 就会错。
+    直接设在轨道上，作用域最小、最不容易被覆盖。
+  */
+  volTrack.style.setProperty('--v', v)
+  $('volVal').textContent = Math.round(v * 100) + '%'
+}
+
+function setVolFromEvent (e) {
+  const r = volTrack.getBoundingClientRect()
+  // 从底部往上：y 越大音量越小
+  let v = 1 - (e.clientY - r.top) / r.height
+  v = Math.max(0, Math.min(1, v))
+  applyVolume(v, 'local')
+}
+
+/**
+ * 音量的单一入口。
+ *
+ * source='local'：用户拖滑块 → 只改本地
+ * source='phone'：手机音量键 → 同步滑块显示（gain 已由手机侧静音语义接管）
+ *
+ * 手机音量键现在是电脑音量的遥控器：手机端 ContentObserver 捕获
+ * 音量变化 → 1 字节消息 → /meta 的 phoneVolume → 这里同步。
+ * 两个来源最终都落在 wifiAudio.setVolume 上，谁后到谁生效。
+ */
+let lastPhoneVol = -1
+function applyVolume (v, source) {
+  v = Math.max(0, Math.min(1, v))
+  paintVol(v)
+  if (wifiAudio) wifiAudio.setVolume(v)
+  if (source === 'local') {
+    try { localStorage.setItem('mw:vol', String(v)) } catch {}
+  }
+}
+
+// 轮询手机音量（音量键按下时手机会推 1 字节消息到接收端）
+setInterval(() => {
+  fetch('http://127.0.0.1:43111/meta', { cache: 'no-store' })
+    .then(r => r.json())
+    .then(j => {
+      if (!j || !j.ok || typeof j.phoneVolume !== 'number') return
+      if (j.phoneVolume === lastPhoneVol) return
+      lastPhoneVol = j.phoneVolume
+      // 只同步显示和 gain，不写回手机
+      applyVolume(j.phoneVolume / 255, 'phone')
+    })
+    .catch(() => {})
+}, 1500)
+
+volTrack.addEventListener('pointerdown', e => {
+  e.preventDefault()
+  volTrack.setPointerCapture(e.pointerId)
+  /** 拖动中给弹层加 .drag：滑块放大 + 光晕，明确「正在调」 */
+  volPop.classList.add('drag')
+  setVolFromEvent(e)
+  const move = ev => setVolFromEvent(ev)
+  const up = () => {
+    volPop.classList.remove('drag')
+    volTrack.removeEventListener('pointermove', move)
+    volTrack.removeEventListener('pointerup', up)
+    volTrack.removeEventListener('pointercancel', up)
+    try { volTrack.releasePointerCapture(e.pointerId) } catch {}
+  }
+  volTrack.addEventListener('pointermove', move)
+  volTrack.addEventListener('pointerup', up)
+  volTrack.addEventListener('pointercancel', up)
+})
+
+$('btnVol').addEventListener('click', e => {
+  e.stopPropagation()
+  const willOpen = !volPop.classList.contains('open')
+  // 与设置面板互斥：两个浮层都贴在标题栏下方，同时开会叠在一起
+  if (willOpen) setPanelOpen(false)
+  volPop.classList.toggle('open', willOpen)
+  $('btnVol').classList.toggle('on', willOpen)
+})
+// 点别处关闭
+document.addEventListener('pointerdown', e => {
+  if (!volPop.classList.contains('open')) return
+  if (e.target.closest('#volPop') || e.target.closest('#btnVol')) return
+  volPop.classList.remove('open')
+  $('btnVol').classList.remove('on')
+})
+
+// 还原上次音量
+try {
+  const saved = parseFloat(localStorage.getItem('mw:vol') || '1')
+  paintVol(Number.isFinite(saved) ? saved : 1)
+} catch { paintVol(1) }
+// 点面板外部关闭（面板自身与顶部齿轮除外）
+document.addEventListener('pointerdown', e => {
+  if (!panelOpen) return
+  if (e.target.closest('#panel') || e.target.closest('#btnPanel')) return
+  setPanelOpen(false)
+})
+
+/**
+ * 置顶状态同步。
+ *
+ * 现在只有一个入口：标题栏的圆钉按钮 #btnTop。
+ * 「更多」菜单里的置顶行已经删掉 —— 同一个开关摆两处，用户还得判断
+ * 哪一处才是当前状态，属于纯噪声。
+ *
+ * 这里同时改 class 和 title：按钮是纯图标，没有文字，
+ * 靠 title 让用户悬停时能确认「现在是开还是关」。
+ */
+function paintPin () {
+  const t = $('btnTop')
+  if (t) {
+    t.classList.toggle('on', !!state.pinned)
+    t.title = state.pinned ? '窗口置顶：开（点击取消）' : '窗口置顶：关（点击开启）'
+  }
+}
+
+$('btnRatio').addEventListener('click', e => {
+  state.ratioLock = !state.ratioLock
+  e.currentTarget.classList.toggle('on', state.ratioLock)
+  window.api.setRatio(state.ratioLock)
+})
+$('btnMinus').addEventListener('click', () => window.api.scale(0.88))
+$('btnPlus').addEventListener('click', () => window.api.scale(1.14))
+
+/* 重置视图：尺寸、透明度回到「看得见」的状态。
+   置顶不跟着改 —— 默认就是关的，重置顺手打开等于偷偷改设置。 */
+$('btnReset').addEventListener('click', () => {
+  state.contentOp = 1
+  state.bgOp = 1
+  paintOpacity()
+  window.api.reset()
+  addLocalLog('info', '视图已重置：360×640 / 透明度 100% / 置顶' + (state.pinned ? '开' : '关'))
+})
+
+$('btnClose').addEventListener('click', () => window.api.close())
+
+/* ==========================================================================
+   画质档位切换
+   --------------------------------------------------------------------------
+   档位表只在主进程维护（TIERS），前端通过 qualityList() 拿回来渲染。
+   这样以后加减档位、改参数，只改 main.js 一处，不用两边同步。
+
+   交互：标题栏的 #qualityChip 显示当前档位名，点开 #qualityMenu 下拉，
+   选中某项即热切换（投屏中约 4~5 秒，期间黑一下）。
+   ========================================================================== */
+let qualityTiers = []
+let qualityCurrent = ''
+
+function qualityName (id) {
+  const t = qualityTiers.find(x => x.id === id)
+  return t ? t.name : id
+}
+
+/**
+ * 更新标题栏那个清晰度按钮。
+ *
+ * 注意：现在按钮里除了文字还有两个 SVG（闪电 + 箭头），
+ * 所以**不能**再写 `chip.textContent = ...` —— 那会把图标一起清掉，
+ * 只留下一个裸文字按钮。文字单独走 #qualityText。
+ */
+function paintQuality () {
+  const chip = $('qualityChip')
+  if (!chip) return
+  const txt = $('qualityText')
+  if (txt) txt.textContent = qualityName(qualityCurrent) || '清晰度'
+  const t = qualityTiers.find(x => x.id === qualityCurrent)
+  chip.title = t
+    ? `清晰度：${t.name}\n约 ${Math.round(t.maxSize * 1260 / 2844)}×${t.maxSize} · ${t.bitRate} · ${t.fps}fps\n点击切换（Ctrl+1~4）`
+    : '清晰度'
+  renderQualityMenu()
+}
+
+/** 渲染下拉里的档位列表 */
+function renderQualityMenu () {
+  const menu = $('qualityMenu')
+  if (!menu) return
+  menu.innerHTML = ''
+  /**
+   * 菜单标题行：说明这是干什么的，顺便把快捷键教给用户。
+   * 商业客户端的下拉几乎都有这一行，没有它列表就是一坨无标题选项。
+   */
+  const head = document.createElement('div')
+  head.className = 'mhead'
+  head.innerHTML = '<span>清晰度</span><span class="mhint">Ctrl 1-4</span>'
+  menu.appendChild(head)
+
+  for (const t of qualityTiers) {
+    const on = t.id === qualityCurrent
+    const item = document.createElement('div')
+    item.className = 'qitem' + (on ? ' on' : '')
+    item.dataset.id = t.id
+    item.title = t.note || ''
+    item.innerHTML =
+      `<span class="qn">${t.name}</span>` +
+      `<span class="qd">${Math.round(t.maxSize * 1260 / 2844)}×${t.maxSize} · ${t.fps}fps</span>` +
+      `<span class="qtick">✓</span>`
+    item.addEventListener('click', () => {
+      closeMenus()
+      if (!on) setQuality(t.id)
+    })
+    menu.appendChild(item)
+  }
+}
+
+/** 关掉所有弹出菜单（清晰度 / 更多），并复位按钮的 open 态 */
+function closeMenus () {
+  const q = $('qualityMenu'); if (q) q.classList.remove('open')
+  const m = $('moreMenu'); if (m) m.classList.remove('open')
+  const qc = $('qualityChip'); if (qc) qc.classList.remove('open')
+  const bm = $('btnMore'); if (bm) bm.classList.remove('on')
+}
+
+function toggleQualityMenu () {
+  const menu = $('qualityMenu')
+  if (!menu) return
+  const willOpen = !menu.classList.contains('open')
+  closeMenus()
+  menu.classList.toggle('open', willOpen)
+  const chip = $('qualityChip')
+  if (chip) chip.classList.toggle('open', willOpen)
+  if (willOpen && !qualityTiers.length) loadQuality()
+}
+
+/** 「更多」菜单开关 */
+function toggleMoreMenu () {
+  const menu = $('moreMenu')
+  if (!menu) return
+  const willOpen = !menu.classList.contains('open')
+  closeMenus()
+  menu.classList.toggle('open', willOpen)
+  const bm = $('btnMore')
+  if (bm) bm.classList.toggle('on', willOpen)
+}
+
+async function loadQuality () {
+  try {
+    const r = await window.api.qualityList()
+    if (r && r.ok) {
+      qualityTiers = r.tiers || []
+      qualityCurrent = r.current || ''
+      paintQuality()
+    }
+  } catch (e) {
+    addLocalLog('warn', '读档位失败: ' + e.message)
+  }
+}
+
+/** 切到指定档位 —— 下拉项、快捷键、外部调用都走这里 */
+async function setQuality (id) {
+  const chip = $('qualityChip')
+  if (chip && chip.dataset.busy === '1') return
+  if (chip) { chip.dataset.busy = '1'; chip.classList.add('busy') }
+  try {
+    const r = await window.api.qualitySet(id)
+    if (r && r.ok) {
+      qualityCurrent = r.current
+      paintQuality()
+      addLocalLog('ok', '画质切到「' + qualityName(r.current) + '」')
+    } else {
+      addLocalLog('error', '切换失败: ' + ((r && r.error) || '未知'))
+      paintQuality()
+    }
+  } catch (e) {
+    addLocalLog('error', '切换异常: ' + e.message)
+  } finally {
+    if (chip) { delete chip.dataset.busy; chip.classList.remove('busy') }
+  }
+}
+
+/* 标题栏胶囊：点开/收起下拉 */
+$('qualityChip').addEventListener('click', e => {
+  e.stopPropagation()
+  toggleQualityMenu()
+})
+
+/* 点别处关闭所有下拉 */
+document.addEventListener('pointerdown', e => {
+  const q = $('qualityMenu')
+  const m = $('moreMenu')
+  const qOpen = q && q.classList.contains('open')
+  const mOpen = m && m.classList.contains('open')
+  if (!qOpen && !mOpen) return
+  if (e.target.closest('#qualityMenu') || e.target.closest('#qualityChip')) return
+  if (e.target.closest('#moreMenu') || e.target.closest('#btnMore')) return
+  closeMenus()
+})
+
+/* 「更多」按钮 */
+$('btnMore').addEventListener('click', e => {
+  e.stopPropagation()
+  toggleMoreMenu()
+})
+
+/**
+ * 「更多」菜单里的设置项 —— 复用原来的按钮 id，
+ * 点完之后把菜单收起来，否则菜单会挂在打开的面板上方。
+ * （置顶行已删除，只剩设置一项。）
+ */
+$('btnPanel').addEventListener('click', () => { setTimeout(closeMenus, 0) })
+
+/* Esc 先关菜单，没有菜单时才交给下面的全局 Esc（关窗口）逻辑 */
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return
+  const anyOpen = [$('qualityMenu'), $('moreMenu')].some(x => x && x.classList.contains('open'))
+  if (anyOpen) { e.stopPropagation(); closeMenus() }
+}, true)
+
+/**
+ * 键盘快捷键：Ctrl+1/2/3/4 直接选第 N 档。
+ *
+ * 给重度用户和自动化测试用 —— 比点两下（开下拉 → 选项）快。
+ */
+document.addEventListener('keydown', e => {
+  if (!e.ctrlKey || e.altKey || e.metaKey) return
+  const n = parseInt(e.key, 10)
+  if (!(n >= 1 && n <= 9)) return
+  const t = qualityTiers[n - 1]
+  if (!t) return
+  e.preventDefault()
+  setQuality(t.id)
+})
+
+// 主进程热切换 / 别处改了配置时同步过来
+if (window.api.onQualityChanged) {
+  window.api.onQualityChanged(d => {
+    if (d && d.current) {
+      qualityCurrent = d.current
+      paintQuality()
+    }
+  })
+}
+
+// 启动时读一次
+loadQuality()
+
+/* ==========================================================================
+   反向控制：在画面上点击/拖动 → 手机上对应位置
+   --------------------------------------------------------------------------
+   坐标换算是最容易错的地方，理清一下：
+
+   1. canvas 的**像素**尺寸 = 视频原始分辨率（例如 720×1626）
+      canvas 的**显示**尺寸由 CSS max-width/height 约束，可能缩放
+   2. 鼠标事件给的是相对于元素的 CSS 像素
+   3. 所以：手机坐标 = event 位置 / 显示尺寸 × 视频原始尺寸
+
+   用 getBoundingClientRect() 拿显示尺寸，乘以 canvas.width/height 的比例
+   就得到手机上的真实像素坐标。这样无论窗口被缩放到多大都对。
+   ========================================================================== */
+
+/** 把鼠标事件坐标换算成手机屏幕像素坐标 */
+function toPhoneXY (e) {
+  const r = canvas.getBoundingClientRect()
+  if (!r.width || !r.height) return null
+  // 显示尺寸 → 视频像素尺寸
+  const sx = canvas.width / r.width
+  const sy = canvas.height / r.height
+  return {
+    x: Math.round((e.clientX - r.left) * sx),
+    y: Math.round((e.clientY - r.top) * sy)
+  }
+}
+
+let ctlDown = null        // { x, y, t, moved }
+let ctlMoved = false
+const TAP_MAX_MS = 260    // 按下到抬起短于这个且没移动 → 判定为点击
+const MOVE_MIN_PX = 6     // CSS 像素，超过才算拖动
+
+canvas.addEventListener('pointerdown', e => {
+  // 左键才控制，右键留给菜单（将来可以放返回键）
+  if (e.button !== 0) return
+  const p = toPhoneXY(e)
+  if (!p) return
+
+  e.preventDefault()
+  ctlDown = { x: p.x, y: p.y, t: Date.now() }
+  ctlMoved = false
+  $('stage').classList.add('ctl-active')
+  try { canvas.setPointerCapture(e.pointerId) } catch {}
+
+  /**
+   * ══════════ 按下即发，不等抬起 ══════════
+   *
+   * 原来的逻辑是「pointerup 时才判断是 tap / swipe / 长按」，
+   * 意味着用户按下去到抬手这段时间，手机端完全没收到任何指令。
+   * 抬手快的话还好，抬手慢（或者手指有点停顿）就会明显感觉「点了没反应」。
+   *
+   * 现在改成：按下立刻发一次 tap，让手机立即响应。
+   * 如果后续判定为拖动，再补一个 swipe —— 因为 swipe 的第一帧就是
+   * 从按下点开始，覆盖上去视觉上是连续的，不会有「先点后拖」的割裂感。
+   *
+   * 长按仍走长按分支：按下时先发了 tap，长按会额外触发一次
+   * longPress，Android 上表现为「点了一下然后长按」——
+   * 对绝大多数 App 而言（菜单、放大、复制）行为是一致的。
+   */
+  const optimisticTap = { sent: true, at: Date.now() }
+  window.api.ctlTap({ x: p.x, y: p.y })
+
+  const startClientX = e.clientX
+  const startClientY = e.clientY
+
+  const move = ev => {
+    if (!ctlDown) return
+    const dx = ev.clientX - startClientX
+    const dy = ev.clientY - startClientY
+    if (!ctlMoved && Math.hypot(dx, dy) > MOVE_MIN_PX) ctlMoved = true
+  }
+
+  const finish = ev => {
+    canvas.removeEventListener('pointermove', move)
+    canvas.removeEventListener('pointerup', finish)
+    canvas.removeEventListener('pointercancel', finish)
+    $('stage').classList.remove('ctl-active')
+
+    if (!ctlDown) return
+    const down = ctlDown
+    ctlDown = null
+
+    const p2 = toPhoneXY(ev)
+    const heldMs = Date.now() - down.t
+
+    if (ctlMoved && p2) {
+      /**
+       * 拖动 / 滑动。
+       *
+       * 只在抬起时发一次 swipe，而不是每次 pointermove 都发。
+       * 原因：一次 adb input 要 fork 进程，约 30ms 往返，
+       * 60fps 拖动意味着每帧都要发 —— 队列会瞬间堆满，操作变成几秒前的回放。
+       * adb swipe 支持时长参数，系统自己插值，观感反而更顺。
+       */
+      window.api.ctlSwipe({
+        x1: down.x, y1: down.y,
+        x2: p2.x, y2: p2.y,
+        ms: Math.min(1200, Math.max(80, heldMs))
+      })
+    } else if (heldMs >= 650) {
+      // 按住不动 650ms 以上 → 长按
+      window.api.ctlLongPress({ x: down.x, y: down.y, ms: Math.min(3000, heldMs) })
+    } else {
+      /**
+       * 普通点击不再重发 —— 按下时已经发过了（optimisticTap）。
+       *
+       * 只在「按下的位置和抬起的位置有偏移」这种少见情况下补发，
+       * 保证点到的确实是用户最终松开的那一点。
+       */
+      if (optimisticTap.sent) {
+        const dx = Math.abs(p2 ? p2.x - down.x : 0)
+        const dy = Math.abs(p2 ? p2.y - down.y : 0)
+        if (p2 && (dx > 8 || dy > 8)) {
+          window.api.ctlTap({ x: p2.x, y: p2.y })
+        }
+      }
+    }
+  }
+
+  canvas.addEventListener('pointermove', move)
+  canvas.addEventListener('pointerup', finish)
+  canvas.addEventListener('pointercancel', finish)
+})
+
+/**
+ * 滚轮 → 手机滚动。
+ *
+ * 用 scrcpy 的 inject_scroll 而不是伪造一段 swipe：
+ *   - scroll 是原生滚动事件，系统会带惯性，手感接近触控板
+ *   - swipe 是「手指滑动」，在长列表里会变成快速甩动，不好控制
+ *
+ * vscroll 正值向下。滚轮向下滚（deltaY > 0）对应内容往下走，
+ * 所以直接用 deltaY 归一化后的值，符号一致。
+ */
+let wheelAcc = 0
+let wheelTimer = null
+canvas.addEventListener('wheel', e => {
+  e.preventDefault()
+
+  const r = canvas.getBoundingClientRect()
+  if (!r.width) return
+  // 用鼠标位置作为滚动锚点，而不是画面中心 —— 更符合直觉
+  const p = toPhoneXY(e)
+  if (!p) return
+
+  /**
+   * 累积 + 节流。
+   *
+   * 鼠标滚轮一格通常 deltaY = ±100，一次发一格会太碎，
+   * 而触摸板一次滑动会连发几十个事件，逐个发又会把通道打满。
+   * 这里把 120ms 内的滚动量累加，一次性发出去。
+   */
+  wheelAcc += e.deltaY
+  if (wheelTimer) return
+  wheelTimer = setTimeout(() => {
+    const v = Math.max(-30, Math.min(30, -wheelAcc / 40))
+    wheelAcc = 0
+    wheelTimer = null
+    if (Math.abs(v) >= 1) {
+      window.api.ctlScroll({ x: p.x, y: p.y, hx: 0, vy: v })
+    }
+  }, 120)
+}, { passive: false })
+
+/**
+ * 键盘输入。
+ *
+ * 只在窗口聚焦、且画面上一次被点过之后才转发，
+ * 否则用户按 Esc 退出、按快捷键调设置都会被当成手机输入。
+ */
+let ctlFocus = false
+canvas.addEventListener('pointerdown', () => { ctlFocus = true })
+document.addEventListener('pointerdown', e => {
+  if (!e.target.closest('#video')) ctlFocus = false
+})
+
+const KEY_MAP = {
+  Backspace: 'KEYCODE_DEL',
+  Enter: 'KEYCODE_ENTER',
+  Escape: 'KEYCODE_BACK',
+  ArrowUp: 'KEYCODE_DPAD_UP',
+  ArrowDown: 'KEYCODE_DPAD_DOWN',
+  ArrowLeft: 'KEYCODE_DPAD_LEFT',
+  ArrowRight: 'KEYCODE_DPAD_RIGHT',
+  Home: 'KEYCODE_HOME',
+  Tab: 'KEYCODE_TAB'
+}
+
+document.addEventListener('keydown', e => {
+  if (!ctlFocus) return
+  if (e.ctrlKey || e.altKey || e.metaKey) return
+
+  if (KEY_MAP[e.key]) {
+    e.preventDefault()
+    window.api.ctlKey(KEY_MAP[e.key])
+    return
+  }
+  // 单个可见字符：交给 adb input text
+  if (e.key.length === 1) {
+    e.preventDefault()
+    window.api.ctlText(e.key)
+  }
+})
+
+// 主进程回报的控制提示
+if (window.api.onCtlMsg) {
+  window.api.onCtlMsg(d => {
+    if (d) addLocalLog(d.level || 'info', d.text || String(d))
+  })
+}
+
+/* WiFi 一键自动连接：缓存 → mDNS → 网段扫描，不用手输 IP、不用扫码。
+   换一台手机也能用：只要它和电脑在同一个 WiFi，并且开发者选项里开过
+   无线调试（或 USB 插过一次执行 adb tcpip 5555），这里会自动发现并连上。 */
+$('btnWifi').addEventListener('click', async () => {
+  const btn = $('btnWifi')
+  if (btn.dataset.busy === '1') return
+  btn.dataset.busy = '1'
+  setDot('wait')
+  $('phTitle').textContent = '正在查找手机…'
+  $('phBody').textContent = '扫描同一 WiFi 下的设备'
+  placeholder.style.display = 'flex'
+  addLocalLog('info', 'WiFi 自动连接：开始发现设备')
+
+  try {
+    const r = await window.api.quickWifi()
+    if (!r || !r.ok) {
+      setDot('err')
+      $('phTitle').textContent = '没找到手机'
+      $('phBody').textContent = (r && r.error) || '确认手机和电脑在同一个 WiFi'
+      addLocalLog('error', 'WiFi 自动连接失败: ' + ((r && r.error) || '未知错误'))
+      return
+    }
+
+    addLocalLog('ok', `WiFi 已连上 ${r.target}（来源 ${r.via}，耗时 ${r.took}ms）`)
+    $('phTitle').textContent = '已连接 ' + r.target
+    $('phBody').textContent = '正在建立投屏通道'
+
+    if (state.streaming) await window.api.stopStream()
+    framesDecoded = 0
+    destroyDecoder()
+    state.streaming = false
+
+    const s = await window.api.startStream({})
+    if (!s || !s.ok) {
+      setDot('err')
+      $('phTitle').textContent = '连上了但投屏失败'
+      $('phBody').textContent = (s && s.error) || '未知错误'
+      addLocalLog('error', '投屏启动失败: ' + ((s && s.error) || '未知错误'))
+    } else {
+      state.streaming = true
+      $('phTitle').textContent = '等待首帧…'
+      $('phBody').textContent = '通道已建立，马上出画面'
+    }
+  } catch (e) {
+    setDot('err')
+    $('phTitle').textContent = 'WiFi 连接异常'
+    $('phBody').textContent = e.message || String(e)
+    addLocalLog('error', 'WiFi 连接异常: ' + (e.message || e))
+  } finally {
+    btn.dataset.busy = ''
+  }
+})
+
+/* 重新连接：断开当前会话再连一次。
+   之前这个按钮是「开始投屏/停止」二态，很误导 —— 迷你窗打开时
+   画面本来就是自动开始投的，用户不需要再点一次。 */
+$('btnStart').addEventListener('click', async () => {
+  const btn = $('btnStart')
+  if (btn.dataset.busy === '1') return
+  btn.dataset.busy = '1'
+
+  setDot('wait')
+  $('phTitle').textContent = '正在重新连接…'
+  $('phBody').textContent = '稍等，正在断开旧会话'
+  placeholder.style.display = 'flex'
+  addLocalLog('info', '手动重新连接')
+
+  try {
+    if (state.streaming) await window.api.stopStream()
+    framesDecoded = 0
+    destroyDecoder()
+    state.streaming = false
+
+    $('phTitle').textContent = '正在连接手机…'
+    $('phBody').textContent = '检查设备授权状态'
+    const r = await window.api.startStream({})
+
+    if (!r || !r.ok) {
+      setDot('err')
+      // 失败原因直接写在占位层上 —— 之前是弹日志抽屉，
+      // 但那个抽屉已经去掉了，而且把原因摆在画面中央比弹面板更直白
+      $('phTitle').textContent = '连接失败'
+      $('phBody').textContent = (r && r.error) || '未知错误'
+      placeholder.style.display = 'flex'
+      addLocalLog('error', '重连失败: ' + ((r && r.error) || '未知错误'))
+    } else {
+      state.streaming = true
+      $('phTitle').textContent = '等待首帧…'
+      $('phBody').textContent = '通道已建立，马上出画面'
+    }
+  } catch (e) {
+    setDot('err')
+    $('phTitle').textContent = '连接失败'
+    $('phBody').textContent = e.message
+    addLocalLog('error', '重连异常: ' + e.message)
+  } finally {
+    delete btn.dataset.busy
+  }
+})
+
+window.addEventListener('wheel', e => {
+  if (!e.ctrlKey && !e.altKey) return
+  e.preventDefault()
+  window.api.scale(e.deltaY < 0 ? 1.06 : 0.94)
+}, { passive: false })
+
+/* ============ 初始化 ============ */
+/**
+ * 先用默认值把 UI 画出来（不回写主进程），等拿到真实状态后再同步一次。
+ *
+ * 之前的问题：paintOpacity() 无条件调用 setOpacity()，初始化那一拍
+ * 用的还是默认/残留值，直接把主进程的配置覆盖掉 —— 表现为
+ * 每次启动透明度都变成上一次测试残留的数字（实测 16%）。
+ */
+paintOpacity(false)
+renderSize()
+
+window.api.state().then(s => {
+  state.contentOp = typeof s.contentOp === 'number' ? s.contentOp : 1
+  state.bgOp = typeof s.bgOp === 'number' ? s.bgOp : 1
+  state.ratioLock = s.ratioLock !== false
+  /**
+   * 置顶默认关。
+   *
+   * 原来的写法是 `s.pinned !== false` —— 也就是「只要不是明确的 false 就当 true」。
+   * 老配置文件里没有这个字段时会被判成 true，用户明明没开过置顶，
+   * 窗口却一直压在别的程序上面（而且他自己不知道为什么）。
+   * 现在只有主进程明确给了 true 才置顶。
+   */
+  state.pinned = s.pinned === true
+  liveSize = { w: s.w, h: s.h }
+  $('btnRatio').classList.toggle('on', state.ratioLock)
+  paintPin()
+  // 这里也不回写：值本来就从主进程来，写回去纯属多余且有竞态
+  paintOpacity(false)
+  renderSize()
+}).catch(() => {
+  addLocalLog('warn', '读取窗口状态失败，使用默认值')
+})
+
+/* ════════ WiFi 模式：手机 App 推流，从 HTTP 源拉帧 ════════ */
+/**
+ * 与 scrcpy 模式的区别：
+ *   - 数据来自本地 HTTP（wifi-receiver.js），不走 adb reverse
+ *   - config 用 JSON 拿（codecString + description 字节数组）
+ *   - 帧是裸 AVCC（length-prefixed），直接喂解码器
+ *   - 拉帧用「带版本号的轮询」：receiver 有新帧才返回 200，没有就 204，
+ *     这样不会空转，也不会积压
+ */
+let wifiRunning = false
+/** 音频播放器实例（WiFi 模式才有） */
+let wifiAudio = null
+
+window.api.onWifiStart(({ source }) => {
+  if (wifiRunning) return
+  wifiRunning = true
+  addLocalLog('info', 'WiFi 模式启动: ' + source)
+
+  /**
+   * 启动音频（与视频并行，互不阻塞）。
+   *
+   * ── 为什么要重试 ──
+   *
+   * AudioSpecificConfig 是手机端音频编码器启动时发的一次性包。
+   * 如果接收端刚好在那之后才启动（很常见：先开窗口再让手机连，
+   * 或者中途重启过接收端），配置就永远收不到了 ——
+   * 此时 /audio-config 返回 204，渲染层会直接放弃，
+   * 结果是「有声音数据在传但电脑一直没声」。
+   *
+   * 现在改成轮询等待：最多等 20 秒，每 500ms 试一次。
+   * 手机重连时会补发配置（见 StreamEngine 的 audioCfgChunk），
+   * 所以只要能等到那一刻就能自动恢复。
+   */
+  ;(async () => {
+    try {
+      const mod = await import('./wifi-audio.js')
+      if (wifiAudio) { try { await wifiAudio.stop() } catch {} }
+
+      const audio = new mod.WifiAudio(source)
+      audio.onLog((lv, msg) => addLocalLog(lv, '音频: ' + msg))
+
+      let r = null
+      for (let i = 0; i < 40; i++) {
+        r = await audio.start()
+        if (r.ok) break
+        if (r.error !== 'no-audio') break      // 真错误就别重试了
+        await new Promise(z => setTimeout(z, 500))
+      }
+
+      if (!r || !r.ok) {
+        addLocalLog('warn', '没有音频: ' + ((r && r.error) || '未知'))
+        try { await audio.stop() } catch {}
+        return
+      }
+
+      // 应用用户上次设置的音量
+      try {
+        const saved = parseFloat(localStorage.getItem('mw:vol') || '1')
+        audio.setVolume(Number.isFinite(saved) ? saved : 1)
+      } catch {}
+
+      wifiAudio = audio
+      addLocalLog('ok', '音频已开启')
+    } catch (e) {
+      addLocalLog('warn', '音频模块加载失败: ' + e.message)
+    }
+  })()
+
+  ;(async () => {
+    try {
+      // 1. 拿 config
+      const cfg = await fetch(source + '/config').then(r => r.json())
+      if (!cfg.ok || !cfg.codecString) {
+        addLocalLog('error', 'WiFi 源没有 config')
+        return
+      }
+      const descBytes = cfg.description ? new Uint8Array(cfg.description) : null
+      addLocalLog('ok', 'codec ' + cfg.codecString)
+
+      state.videoSize = cfg.videoSize || { w: 720, h: 1600 }
+      state.codecString = cfg.codecString
+      if (!ensureDecoder(cfg.codecString, state.videoSize.w, state.videoSize.h, descBytes)) {
+        addLocalLog('error', 'WiFi 模式解码器配置失败')
+        return
+      }
+
+      /**
+       * 3. 先取关键帧补位。
+       *
+       * configure() 之后解码器必须先吃一个 IDR 才能解 delta 帧。
+       * 而 /frame 只保留最新一帧，2 秒才出现一次的 IDR 很容易被轮询错过
+       * → 一直 decoded=0、画面空白。所以先单独拿 lastKey 喂进去。
+       */
+      let gotKey = false
+      for (let i = 0; i < 30 && wifiRunning && !gotKey; i++) {
+        try {
+          const rk = await fetch(source + '/keyframe', { cache: 'no-store' })
+          if (rk.status === 200) {
+            const kb = new Uint8Array(await rk.arrayBuffer())
+            if (kb.length > 4 && (kb[4] & 0x1f) === 5) {
+              feedFrame({ data: kb, pts: Date.now() * 1000, key: true, codecString: cfg.codecString })
+              gotKey = true
+              addLocalLog('ok', 'WiFi 关键帧已补位')
+              break
+            }
+          }
+        } catch (e) { /* 还没收到 IDR，稍后重试 */ }
+        await new Promise(z => setTimeout(z, 400))
+      }
+      if (!gotKey) addLocalLog('warn', '暂时没拿到关键帧，等下一个 IDR')
+
+      /**
+       * 4. 拉帧循环 —— 长轮询 /frames，按 seq 顺序喂。
+       *
+       * 两个关键点：
+       *
+       * (a) 批量：一次取最多 12 帧。轮询慢于编码时会跳过中间的 P 帧，
+       *     而 H.264 的 P 帧靠前序帧预测 —— 跳一帧就是参考图全错，
+       *     屏幕上出现绿块/残影，也就是花屏。批量取能保证顺序完整。
+       *
+       * (b) 长轮询：wait=800 让服务端在没帧时把请求挂起，
+       *     一有帧进来立刻返回。之前是「立刻回 204 → 再发一次」的空转，
+       *     每个往返 3~8ms，30fps 下白白吃掉大量时间窗，
+       *     实测帧率在 0/63/4 之间乱跳。现在没有无效往返。
+       */
+      const tgt = source + '/frames?n=12&wait=800'
+      let fail = 0
+      let lastSeq = -1
+      let serverDropped = 0
+      startWatchdog()
+      while (wifiRunning) {
+        try {
+          const r = await fetch(tgt, { cache: 'no-store' })
+          // 204 = 服务端等满 800ms 也没有新帧，正常情况，直接下一轮
+          if (r.status === 204) continue
+          if (!r.ok) throw new Error('HTTP ' + r.status)
+
+          const buf = await r.arrayBuffer()
+          fail = 0
+
+          /**
+           * 服务端丢过帧 → 参考链已断。
+           *
+           * 接收端队列满会丢掉最旧的帧（见 wifi-receiver.js 的 90 帧上限）。
+           * 一旦发生，继续喂后面的 P 帧只会解出错位的画面，
+           * 所以这里主动丢掉手里的、置 gotKey=false，
+           * 等下一个 IDR 重新起头 —— 画面会短暂一顿，然后干净恢复。
+           */
+          const dropped = Number(r.headers.get('x-dropped') || 0)
+          if (dropped > serverDropped) {
+            serverDropped = dropped
+            gotKey = false
+            addLocalLog('warn', '接收端丢帧 ' + dropped + '，等下一个关键帧重新同步')
+            await new Promise(z => setTimeout(z, 30))
+            continue
+          }
+
+          const dv = new DataView(buf)
+          const count = dv.getUint32(0)
+          let off = 4
+          for (let i = 0; i < count; i++) {
+            const seq = dv.getUint32(off); off += 4
+            const len = dv.getUint32(off); off += 4
+            const frameData = new Uint8Array(buf, off, len)
+            off += len
+
+            // 乱序保护：已经喂过的 seq 直接跳过
+            if (seq <= lastSeq) continue
+            lastSeq = seq
+
+            const nalType = len > 4 ? (frameData[4] & 0x1f) : 0
+            const isKey = nalType === 5
+            if (!gotKey) {
+              if (!isKey) continue
+              gotKey = true
+              addLocalLog('ok', 'WiFi 关键帧到达')
+            }
+            feedFrame({
+              data: frameData,
+              pts: Date.now() * 1000,
+              key: isKey,
+              codecString: cfg.codecString
+            })
+          }
+        } catch (e) {
+          if (++fail > 5) {
+            addLocalLog('error', 'WiFi 拉流失败: ' + e.message)
+            break
+          }
+          await new Promise(z => setTimeout(z, 500))
+        }
+      }
+      addLocalLog('warn', 'WiFi 拉流退出')
+      stopWatchdog()
+    } catch (e) {
+      addLocalLog('error', 'WiFi 模式异常: ' + e.message)
+    }
+  })()
+})
+</script>
+</body>
+</html>

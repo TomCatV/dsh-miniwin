@@ -1,0 +1,57 @@
+{
+  "name": "dsh-miniwin",
+  "version": "0.2.0",
+  "description": "Phone screen mirroring in the DSH sidebar: scan a QR code to pair, then the phone screen opens in a transparent desktop mini-window. Ships its own scrcpy runtime; content and background opacity are adjustable independently.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "runtime",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "LICENSE",
+    "screenshots.json"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "screen-mirror",
+    "scrcpy",
+    "android",
+    "miniwin"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TomCatV/dsh-miniwin.git"
+  },
+  "homepage": "https://github.com/TomCatV/dsh-miniwin#readme",
+  "bugs": {
+    "url": "https://github.com/TomCatV/dsh-miniwin/issues"
+  },
+  "author": "TomCatV",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "os": [
+    "win32"
+  ],
+  "license": "MIT"
+}
