@@ -681,6 +681,8 @@ async function stopSession () {
   try { if (s.cap) await s.cap.stop() } catch {}
   ipcMain.removeAllListeners('win:frame-ack')
   try { if (s.statsTimer) clearInterval(s.statsTimer) } catch {}
+  // 通道守护也要停 —— 否则它会在会话已死后继续尝试切换，把新会话打断
+  try { if (s.transportTimer) clearInterval(s.transportTimer) } catch {}
   try { if (s.timer) clearTimeout(s.timer) } catch {}
   try { if (s.sock) s.sock.destroy() } catch {}
   try { if (s.controlSock) s.controlSock.destroy() } catch {}
@@ -1844,6 +1846,125 @@ async function startScrcpySession (opts = {}) {
   session.cap = cap
 
   /**
+   * ══════════ 通道守护：USB ⇄ WiFi 自动切换 ══════════
+   *
+   * 用户的原话：「对于用户来说不就是 USB 和 WiFi 两种连接方式吗？
+   * 那 USB 拔掉切 WiFi、WiFi 断开切 USB 你总得做吧」。
+   *
+   * 之前的实际情况：
+   *   · 拔 USB → scrcpy 退出 → scheduleReconnect → startSession 重新选通道。
+   *     这条**能**切到 WiFi，但前提是 adb 设备表里恰好还有那条 ip:5555
+   *     （adbd 重启过、手机换过 IP 就没了）；
+   *   · WiFi 掉线 → 同样只能靠重连；重连里扫不到 WiFi 就会掉进
+   *     waitForPhone 的 3 分钟扫描，用户看到的是「一直没画面」。
+   *
+   * 现在加一个主动守护：每 1.5 秒确认当前通道还在不在，不在就**立刻**
+   * 切到另一条；USB 拔掉且 WiFi 不在表里时，用缓存的手机 IP 主动
+   * `adb connect` 一次再切。
+   *
+   * 与 scheduleReconnect 的关系：切换走 stopSession + startSession，
+   * stopSession 会调 cap._cancelReconnect()，所以不会和退避重连打架。
+   */
+  const mySerial = session.serial
+  const myIsWifi = /:\d+$/.test(mySerial)
+  let switchingTransport = false
+
+  const transportTimer = setInterval(async () => {
+    if (!session || session.serial !== mySerial) return
+    if (switchingTransport) return
+
+    let devs = []
+    try { devs = await keeper.devices() } catch { return }
+
+    // 当前通道还活着 → 什么都不做（判断逻辑在 transport-pick.js，带单测）
+    if (isCurrentAlive(mySerial, devs)) return
+
+    /**
+     * 接下来连哪条？交给纯函数决定。
+     *
+     * 规则本身（USB 掉了用 WiFi / WiFi 掉了用 USB / 只认 state==='device'）
+     * 单独放在 transport-pick.js 里，由 tools/transport-test.js 覆盖 ——
+     * 这段逻辑混进定时器里就没法验，而它正是用户反复要求的能力。
+     */
+    const pick = pickFallbackSerial(mySerial, devs)
+    let target = pick.target
+    const wifiDev2 = devs.find(d => d.isWifi && d.state === 'device')
+
+    /**
+     * USB 掉了但 WiFi 不在表里：先主动连一次。
+     *
+     * 这是「拔线立刻能用无线」的关键 —— 缓存 IP 来自上一次成功的
+     * WiFi 会话（st.lastPhoneIp），adb connect 通常 300~800ms 就回来。
+     */
+    if (!target && !myIsWifi) {
+      /**
+       * WiFi 条目在、但状态是 offline → 连接掉了。先 adb connect 救活，
+       * 比等 scheduleReconnect 退避重试快得多。
+       */
+      const staleWifi = devs.find(d => d.isWifi)
+      if (staleWifi && !wifiDev2) {
+        const sip = String(staleWifi.serial).split(':')[0]
+        try {
+          const adb3 = new Adb(adbPath())
+          const r3 = await adb3.connectWifi(sip, 5555)
+          logLine('info', `[switch] 唤醒 offline 的 WiFi ${sip}:5555 → ${(r3 && (r3.stdout || r3.message)) || 'ok'}`)
+          try { devs = await keeper.devices() } catch {}
+          const w3 = devs.find(d => d.isWifi && d.state === 'device')
+          if (w3) target = w3.serial
+        } catch (e) { logLine('warn', '[switch] 唤醒失败: ' + e.message) }
+      }
+      const ip = st.lastPhoneIp
+      if (!target && ip && /^\d+\.\d+\.\d+\.\d+$/.test(ip)) {
+        try {
+          const adb2 = new Adb(adbPath())
+          const r = await adb2.connectWifi(ip, 5555)
+          logLine('info', `[switch] 主动连接 WiFi ${ip}:5555 → ${(r && (r.stdout || r.message)) || 'ok'}`)
+        } catch (e) {
+          logLine('warn', '[switch] WiFi 主动连接失败: ' + e.message)
+        }
+        try { devs = await keeper.devices() } catch {}
+        const w2 = devs.find(d => d.isWifi && d.state === 'device')
+        if (w2) target = w2.serial
+      }
+    }
+
+    /**
+     * WiFi 通道掉了、USB 也不在：主动把这条 WiFi 连回来。
+     *
+     * 场景：手机换了个 AP / adbd 重连，adb 表里那条变成 offline。
+     * 不救的话只能等 scheduleReconnect 退避到 10 秒后，
+     * 再掉进 waitForPhone 的三分钟扫描 —— 用户看到的就是「一直没画面」。
+     */
+    if (!target && myIsWifi) {
+      const ip2 = mySerial.split(':')[0]
+      try {
+        const adb4 = new Adb(adbPath())
+        const r4 = await adb4.connectWifi(ip2, 5555)
+        logLine('info', `[switch] 重连 WiFi ${ip2}:5555 → ${(r4 && (r4.stdout || r4.message)) || 'ok'}`)
+        try { devs = await keeper.devices() } catch {}
+        const w4 = devs.find(d => d.isWifi && d.state === 'device')
+        if (w4) target = w4.serial
+      } catch (e) { logLine('warn', '[switch] WiFi 重连失败: ' + e.message) }
+    }
+
+    if (!target) return
+
+    switchingTransport = true
+    try {
+      const label = myIsWifi ? 'WiFi → USB' : 'USB → WiFi'
+      logLine('ok', `[switch] 通道切换：${mySerial} → ${target}（${label}）`)
+      pushStatus({ phase: 'connecting', hint: `已自动切换通道：${label}` })
+      await stopSession()
+      await startSession({ serial: target })
+    } catch (e) {
+      logLine('warn', '[switch] 切换失败: ' + e.message)
+    } finally {
+      switchingTransport = false
+    }
+  }, 1500)
+  session.transportTimer = transportTimer
+
+  /**
    * 帧回执 —— 背压计数的唯一出口。
    *
    * lastAckAt 用于检测「ack 长时间不来」的死锁（见上面的 ACK_TIMEOUT）。
@@ -2415,6 +2536,7 @@ async function ensureCtrl () {
   ctrlStarting = (async () => {
     try {
       const { AdbShellControl, DeviceWatcher } = require('./adb-control.js')
+const { pickFallbackSerial, isCurrentAlive, findStaleWifi } = require('./transport-pick.js')
       const c = new AdbShellControl({ adb: adbPath(), serial })
       c.onLog(m => logLine('info', '[ctl] ' + m))
       c.setScreen(lastVideoW || 720, lastVideoH || 1600)
