@@ -49,4 +49,27 @@ function findStaleWifi (devices) {
   return { serial: d.serial, ip, live: d.state === 'device' }
 }
 
-module.exports = { pickFallbackSerial, isCurrentAlive, findStaleWifi }
+/**
+ * 插回 USB 时该不该从 WiFi 切回 USB。
+ *
+ * 用户规则：USB 优先。但两条同时在线时如果立刻切，抖一下线就会来回跳，
+ * 所以要求「连续 N 次都看到在线 USB」才算数。
+ *
+ * @param {string} currentSerial 当前通道
+ * @param {Array} devices adb 设备表
+ * @param {number} seenCount 已经连续看到 USB 的次数
+ * @param {number} need 需要连续几次（默认 3）
+ */
+function shouldUpgradeToUsb (currentSerial, devices, seenCount, need = 3) {
+  const list = Array.isArray(devices) ? devices : []
+  const onWifi = /:\d+$/.test(String(currentSerial || ''))
+  if (!onWifi) return { upgrade: false, serial: null }
+  const usb = list.find(d => d && !d.isWifi && d.state === 'device')
+  if (!usb) return { upgrade: false, serial: null }
+  // 只在真要切的时候给出目标，避免调用方误用
+  return seenCount >= need
+    ? { upgrade: true, serial: usb.serial }
+    : { upgrade: false, serial: null }
+}
+
+module.exports = { pickFallbackSerial, isCurrentAlive, findStaleWifi, shouldUpgradeToUsb }

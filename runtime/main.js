@@ -1932,6 +1932,8 @@ async function startScrcpySession (opts = {}) {
   const mySerial = session.serial
   const myIsWifi = /:\d+$/.test(mySerial)
   let switchingTransport = false
+  /** 连续多少次看到在线的 USB（防抖，1.5 秒/次） */
+  let usbSeenFor = 0
 
   const transportTimer = setInterval(async () => {
     if (!session || session.serial !== mySerial) return
@@ -1940,8 +1942,41 @@ async function startScrcpySession (opts = {}) {
     let devs = []
     try { devs = await keeper.devices() } catch { return }
 
-    // 当前通道还活着 → 什么都不做（判断逻辑在 transport-pick.js，带单测）
-    if (isCurrentAlive(mySerial, devs)) return
+    // 当前通道还活着 → 通常什么都不做
+    if (isCurrentAlive(mySerial, devs)) {
+      /**
+       * 例外：现在走 WiFi、USB 插回来了。
+       *
+       * 用户规则是「USB 优先」——插着线就用线。之前两条同时在线时我们
+       * 什么都不做，于是「拔了再插」会永远停在 WiFi 上，用户以为坏了。
+       *
+       * 连续 3 次（约 4.5 秒）都看到在线 USB 才动手，避免碰一下线就来回切。
+       */
+      if (myIsWifi && devs.some(d => !d.isWifi && d.state === 'device')) {
+        usbSeenFor++
+        // 判断走带单测的纯函数（transport-pick.js / tools/transport-test.cjs）
+        const up = shouldUpgradeToUsb(mySerial, devs, usbSeenFor, 3)
+        if (up.upgrade) {
+          const usbSerial2 = up.serial
+          switchingTransport = true
+          try {
+            logLine('ok', `[switch] USB 回来了 → 切回 USB（${usbSerial2}），比 WiFi 稳`)
+            pushStatus({ phase: 'connecting', hint: 'USB 已插入，正在切回 USB…' })
+            await stopSession()
+            await startSession({ serial: usbSerial2 })
+          } catch (e) {
+            logLine('warn', '[switch] 切回 USB 失败: ' + e.message)
+          } finally {
+            switchingTransport = false
+            usbSeenFor = 0
+          }
+        }
+      } else {
+        usbSeenFor = 0
+      }
+      return
+    }
+    usbSeenFor = 0
 
     /**
      * 接下来连哪条？交给纯函数决定。
@@ -2613,7 +2648,7 @@ async function ensureCtrl () {
   ctrlStarting = (async () => {
     try {
       const { AdbShellControl, DeviceWatcher } = require('./adb-control.js')
-const { pickFallbackSerial, isCurrentAlive, findStaleWifi } = require('./transport-pick.js')
+const { pickFallbackSerial, isCurrentAlive, findStaleWifi, shouldUpgradeToUsb } = require('./transport-pick.js')
       const c = new AdbShellControl({ adb: adbPath(), serial })
       c.onLog(m => logLine('info', '[ctl] ' + m))
       c.setScreen(lastVideoW || 720, lastVideoH || 1600)
