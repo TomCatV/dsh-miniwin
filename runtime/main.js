@@ -44,6 +44,35 @@ const path = require('path')
 const fs = require('fs')
 const { Adb } = require('./device')
 const net = require('net')
+/**
+ * 通道决策的纯函数。
+ *
+ * 必须放在**顶层** —— 之前这行被插进了 ensureCtrl() 内部，
+ * 结果 startScrcpySession 里的通道守护每次 tick 都抛 
+ * ReferenceError: isCurrentAlive is not defined，而异常又被异步回调吞掉，
+ * 表现就是「守护写了但从来不生效」。
+ */
+const { pickFallbackSerial, isCurrentAlive, findStaleWifi, shouldUpgradeToUsb } = require('./transport-pick')
+
+/**
+ * 把一条「adb 说是 already connected、实际是 offline」的 WiFi 连接救回来。
+ *
+ * 实测：adb connect 回 `already connected to 172.31.100.199:5555`，
+ * 但 `adb devices` 里那条仍然是 offline —— 状态卡住了，只 connect 没用。
+ * 必须 disconnect 再 connect 才会重新握手。
+ */
+async function adbReviveWifi (serial) {
+  const { execFile } = require('node:child_process')
+  const run = (args, t = 8000) => new Promise(resolve => {
+    execFile(adbPath(), args, { timeout: t, windowsHide: true },
+      (err, stdout, stderr) => resolve(String(stdout || '') + String(stderr || '')))
+  })
+  await run(['disconnect', serial])
+  await new Promise(r => setTimeout(r, 250))
+  const out = await run(['connect', serial])
+  return { ok: /connected to/i.test(out), out: out.trim() }
+}
+
 
 /**
  * 托盘图标 —— 窗口被盖住/关掉时的最后一道唤回入口。
@@ -1591,7 +1620,15 @@ async function startScrcpySession (opts = {}) {
     throw new Error(r.error || '采集启动失败')
   }
 
-  session = { scrcpyCapture: cap }
+  /**
+   * session.serial 必须写上。
+   *
+   * 通道守护靠它判断「当前用的是哪条通道」，而这里原来只有
+   * { scrcpyCapture: cap } —— session.serial 永远是 undefined，
+   * 守护于是把每条通道都判成「已死」，日志里出现
+   *   [switch] 通道切换：undefined → 172.31.100.199:5555
+   */
+  session = { scrcpyCapture: cap, serial: dev.serial }
   pushStatus({ phase: 'streaming', streaming: true })
   logLine('ok', '投屏已启动（scrcpy 采集）')
 
@@ -1996,131 +2033,97 @@ async function startScrcpySession (opts = {}) {
   let switchingTransport = false
   /** 连续多少次看到在线的 USB（防抖，1.5 秒/次） */
   let usbSeenFor = 0
+  /** 上次尝试唤醒 WiFi 的时间（节流，避免每 1.5 秒刷一次） */
+  let lastWakeAt = 0
 
   const transportTimer = setInterval(async () => {
     if (!session || session.serial !== mySerial) return
     if (switchingTransport) return
+    // 守护里的异常必须留痕：上一版抛了 ReferenceError 被吞掉，谁都看不见
+    try {
+      let devs = []
+      try {
+        devs = await keeper.devices()
+        /**
+         * WifiAdbKeeper.devices() 只返回**在线**设备，而且条目只有
+         * { serial, isWifi } —— 没有 state 字段。
+         *
+         * 守护里所有判断都写的是 state === 'device'，于是永远为假：
+         * 「当前通道还活着」判成已死、「切到 USB」找不到目标，
+         * 表现为一直卡在唤醒 WiFi 那一支。
+         * 这里统一补上 state，后面就能用同一套语义。
+         */
+        devs = (devs || []).map(d => ({
+          serial: d.serial,
+          isWifi: !!d.isWifi,
+          state: d.state || 'device'
+        }))
+      } catch (e) {
+        logLine('warn', '[switch] 读设备表失败: ' + e.message)
+        return
+      }
+      const live = d => d && d.state === 'device'
 
-    let devs = []
-    try { devs = await keeper.devices() } catch { return }
-
-    // 当前通道还活着 → 通常什么都不做
-    if (isCurrentAlive(mySerial, devs)) {
-      /**
-       * 例外：现在走 WiFi、USB 插回来了。
-       *
-       * 用户规则是「USB 优先」——插着线就用线。之前两条同时在线时我们
-       * 什么都不做，于是「拔了再插」会永远停在 WiFi 上，用户以为坏了。
-       *
-       * 连续 3 次（约 4.5 秒）都看到在线 USB 才动手，避免碰一下线就来回切。
-       */
-      if (myIsWifi && devs.some(d => !d.isWifi && d.state === 'device')) {
-        usbSeenFor++
-        // 判断走带单测的纯函数（transport-pick.js / tools/transport-test.cjs）
+      /* ── 当前通道还活着：只在「WiFi 跑着、USB 插回来了」时升级 ── */
+      if (isCurrentAlive(mySerial, devs)) {
+        usbSeenFor = (myIsWifi && devs.some(d => !d.isWifi && live(d))) ? usbSeenFor + 1 : 0
         const up = shouldUpgradeToUsb(mySerial, devs, usbSeenFor, 3)
         if (up.upgrade) {
-          const usbSerial2 = up.serial
           switchingTransport = true
           try {
-            logLine('ok', `[switch] USB 回来了 → 切回 USB（${usbSerial2}），比 WiFi 稳`)
+            logLine('ok', `[switch] USB 回来了 → 切回 USB（${up.serial}），比 WiFi 稳`)
             pushStatus({ phase: 'connecting', hint: 'USB 已插入，正在切回 USB…' })
             await stopSession()
-            await startSession({ serial: usbSerial2 })
+            await startSession({ serial: up.serial })
           } catch (e) {
             logLine('warn', '[switch] 切回 USB 失败: ' + e.message)
-          } finally {
-            switchingTransport = false
-            usbSeenFor = 0
-          }
+          } finally { switchingTransport = false; usbSeenFor = 0 }
         }
-      } else {
-        usbSeenFor = 0
+        return
       }
-      return
-    }
-    usbSeenFor = 0
+      usbSeenFor = 0
 
-    /**
-     * 接下来连哪条？交给纯函数决定。
-     *
-     * 规则本身（USB 掉了用 WiFi / WiFi 掉了用 USB / 只认 state==='device'）
-     * 单独放在 transport-pick.js 里，由 tools/transport-test.js 覆盖 ——
-     * 这段逻辑混进定时器里就没法验，而它正是用户反复要求的能力。
-     */
-    const pick = pickFallbackSerial(mySerial, devs)
-    let target = pick.target
-    const wifiDev2 = devs.find(d => d.isWifi && d.state === 'device')
+      /* ── 当前通道没了：先按规则挑 ── */
+      let target = pickFallbackSerial(mySerial, devs).target
 
-    /**
-     * USB 掉了但 WiFi 不在表里：先主动连一次。
-     *
-     * 这是「拔线立刻能用无线」的关键 —— 缓存 IP 来自上一次成功的
-     * WiFi 会话（st.lastPhoneIp），adb connect 通常 300~800ms 就回来。
-     */
-    if (!target && !myIsWifi) {
       /**
-       * WiFi 条目在、但状态是 offline → 连接掉了。先 adb connect 救活，
-       * 比等 scheduleReconnect 退避重试快得多。
+       * 没得挑就尝试唤醒 WiFi。
+       *
+       * 两个坑：
+       *   ① adb 会回 `already connected`，但 devices 里那条仍是 offline
+       *      —— 只 connect 没用，必须 disconnect 再 connect（adbReviveWifi）。
+       *   ② 不节流的话每 1.5 秒刷一次日志，实测刷了几十条还在原地打转。
        */
-      const staleWifi = devs.find(d => d.isWifi)
-      if (staleWifi && !wifiDev2) {
-        const sip = String(staleWifi.serial).split(':')[0]
-        try {
-          const adb3 = new Adb(adbPath())
-          const r3 = await adb3.connectWifi(sip, 5555)
-          logLine('info', `[switch] 唤醒 offline 的 WiFi ${sip}:5555 → ${(r3 && (r3.stdout || r3.message)) || 'ok'}`)
-          try { devs = await keeper.devices() } catch {}
-          const w3 = devs.find(d => d.isWifi && d.state === 'device')
-          if (w3) target = w3.serial
-        } catch (e) { logLine('warn', '[switch] 唤醒失败: ' + e.message) }
-      }
-      const ip = st.lastPhoneIp
-      if (!target && ip && /^\d+\.\d+\.\d+\.\d+$/.test(ip)) {
-        try {
-          const adb2 = new Adb(adbPath())
-          const r = await adb2.connectWifi(ip, 5555)
-          logLine('info', `[switch] 主动连接 WiFi ${ip}:5555 → ${(r && (r.stdout || r.message)) || 'ok'}`)
-        } catch (e) {
-          logLine('warn', '[switch] WiFi 主动连接失败: ' + e.message)
+      if (!target && Date.now() - lastWakeAt > 8000) {
+        lastWakeAt = Date.now()
+        const stale = devs.find(d => d.isWifi) || null
+        const ip = (stale && String(stale.serial).split(':')[0]) ||
+          (/^\d+\.\d+\.\d+\.\d+$/.test(String(st.lastPhoneIp || '')) ? st.lastPhoneIp : '')
+        if (ip) {
+          try {
+            const r = await adbReviveWifi(ip + ':5555')
+            logLine('info', `[switch] 唤醒 WiFi ${ip}:5555 → ${r.out || (r.ok ? 'ok' : '失败')}`)
+            try { devs = await keeper.devices() } catch {}
+            const w = devs.find(d => d.isWifi && live(d))
+            if (w) target = w.serial
+          } catch (e) { logLine('warn', '[switch] 唤醒失败: ' + e.message) }
         }
-        try { devs = await keeper.devices() } catch {}
-        const w2 = devs.find(d => d.isWifi && d.state === 'device')
-        if (w2) target = w2.serial
       }
-    }
 
-    /**
-     * WiFi 通道掉了、USB 也不在：主动把这条 WiFi 连回来。
-     *
-     * 场景：手机换了个 AP / adbd 重连，adb 表里那条变成 offline。
-     * 不救的话只能等 scheduleReconnect 退避到 10 秒后，
-     * 再掉进 waitForPhone 的三分钟扫描 —— 用户看到的就是「一直没画面」。
-     */
-    if (!target && myIsWifi) {
-      const ip2 = mySerial.split(':')[0]
+      if (!target) return
+
+      switchingTransport = true
       try {
-        const adb4 = new Adb(adbPath())
-        const r4 = await adb4.connectWifi(ip2, 5555)
-        logLine('info', `[switch] 重连 WiFi ${ip2}:5555 → ${(r4 && (r4.stdout || r4.message)) || 'ok'}`)
-        try { devs = await keeper.devices() } catch {}
-        const w4 = devs.find(d => d.isWifi && d.state === 'device')
-        if (w4) target = w4.serial
-      } catch (e) { logLine('warn', '[switch] WiFi 重连失败: ' + e.message) }
-    }
-
-    if (!target) return
-
-    switchingTransport = true
-    try {
-      const label = myIsWifi ? 'WiFi → USB' : 'USB → WiFi'
-      logLine('ok', `[switch] 通道切换：${mySerial} → ${target}（${label}）`)
-      pushStatus({ phase: 'connecting', hint: `已自动切换通道：${label}` })
-      await stopSession()
-      await startSession({ serial: target })
+        const label = myIsWifi ? 'WiFi → USB' : 'USB → WiFi'
+        logLine('ok', `[switch] 通道切换：${mySerial} → ${target}（${label}）`)
+        pushStatus({ phase: 'connecting', hint: `已自动切换通道：${label}` })
+        await stopSession()
+        await startSession({ serial: target })
+      } catch (e) {
+        logLine('warn', '[switch] 切换失败: ' + e.message)
+      } finally { switchingTransport = false }
     } catch (e) {
-      logLine('warn', '[switch] 切换失败: ' + e.message)
-    } finally {
-      switchingTransport = false
+      logLine('warn', '[switch] 守护异常: ' + e.message)
     }
   }, 1500)
   session.transportTimer = transportTimer
@@ -2710,7 +2713,6 @@ async function ensureCtrl () {
   ctrlStarting = (async () => {
     try {
       const { AdbShellControl, DeviceWatcher } = require('./adb-control.js')
-const { pickFallbackSerial, isCurrentAlive, findStaleWifi, shouldUpgradeToUsb } = require('./transport-pick.js')
       const c = new AdbShellControl({ adb: adbPath(), serial })
       c.onLog(m => logLine('info', '[ctl] ' + m))
       c.setScreen(lastVideoW || 720, lastVideoH || 1600)

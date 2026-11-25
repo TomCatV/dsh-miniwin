@@ -117,7 +117,16 @@ class WifiAdbKeeper {
       if (m && m[2] === 'device') {
         list.push({
           serial: m[1],
-          isWifi: /:\d+$/.test(m[1])
+          isWifi: /:\d+$/.test(m[1]),
+          /**
+           * 必须带上 state。
+           *
+           * 这里只 push 了 state==='device' 的行，但调用方（startScrcpySession、
+           * 通道守护）普遍用 `d.state === 'device'` 判断能否使用 —— 少了这个
+           * 字段它们全判假：明明两条通道都在线，却选不出设备，
+           * 守护还会反复"切回 USB"打成死循环。
+           */
+          state: 'device'
         })
       }
     }
