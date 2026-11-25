@@ -64,7 +64,14 @@ class AudioRouter {
      */
     let p = { devices: [], streamVolume: 0 }
     if (this.serial) {
-      const { out } = await this._run(['shell', 'dumpsys audio'])
+      /**
+       * 只取 STREAM_MUSIC 那一段。
+       *
+       * `dumpsys audio` 整份输出在华为上是 80~150KB，每 2 秒过一次 adb
+       * 通道既慢又费电。改在设备端 grep，传输量降到 1KB 上下 ——
+       * 解析不用改，parse() 本来就是从 'STREAM_MUSIC' 开始截的。
+       */
+      const { out } = await this._run(['shell', "dumpsys audio | grep -A40 '^- STREAM_MUSIC'"])
       p = AudioRouter.parse(out)
     }
     const headset = p.devices.some(d => HEADSET_DEVICES.includes(d))

@@ -36,6 +36,13 @@ async function main () {
     const r = await get(API + '/state')
     rec('GET /state', r.status === 200 && !!r.json && r.json.ok !== false,
       r.json && r.json.state ? 'phase=' + r.json.state.phase : 'HTTP ' + r.status)
+    /**
+     * /state 必须同时带回 App 推流端的 meta。
+     * 面板靠它判断「手机在推流」——没有这个字段，纯 WiFi 下状态行
+     * 永远写「手机不在线」。
+     */
+    rec('GET /state 带 wifi 字段', !!(r.json && 'wifi' in r.json),
+      r.json && r.json.wifi ? 'connected=' + r.json.wifi.connected : 'null（接收端没起也算对）')
   } catch (e) { rec('GET /state', false, e.message) }
 
   /* 2. 设备列表（可以空，但必须是合法结构） */
