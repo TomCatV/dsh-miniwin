@@ -187,16 +187,31 @@ class ScrcpyCapture {
 
     if (!/管道连接超时/.test(r.error || '')) return r
 
-    this.log('首次启动失败（' + r.error + '），清理手机侧残留后重试一次')
-    try { await this._killPhoneServer() } catch {}
-    await new Promise(res => setTimeout(res, 1200))
+    /**
+     * 重试次数按通道区分。
+     *
+     * ── 实测：WiFi 的失败是「链路」问题，不是编码器 ──
+     *
+     * 打开 MINIWIN_DEBUG_SCRCPY=1 抓到的真实错误：
+     *   adb: error: failed to read copy response: EOF
+     *   ERROR: "adb push" returned with value 1
+     *   ERROR: Server connection failed
+     *
+     * 也就是 TCP 链路中途断了，server 根本没推上去 —— 和 USB 上
+     * 「编码器被占」是两种完全不同的失败。WiFi 抖一下就得再来一次，
+     * 所以给 WiFi 3 次机会（间隔 1.2 / 2.4 秒），USB 保持 2 次。
+     */
+    const isWifi = /:\d+$/.test(String(this.serial || ''))
+    const ATTEMPTS = isWifi ? 3 : 2
 
-    r = await this._startOnce()
-    if (r.ok) {
-      this.log('重试成功')
-    } else {
-      this.log('重试仍失败：' + (r.error || ''))
+    for (let attempt = 2; attempt <= ATTEMPTS; attempt++) {
+      this.log(`启动失败（${r.error}），清理手机侧残留后第 ${attempt}/${ATTEMPTS} 次尝试`)
+      try { await this._killPhoneServer() } catch {}
+      await new Promise(res => setTimeout(res, attempt === 2 ? 1200 : 2400))
+      r = await this._startOnce()
+      if (r.ok) { this.log(`第 ${attempt} 次尝试成功`); return r }
     }
+    this.log('重试仍失败：' + (r.error || ''))
     return r
   }
 

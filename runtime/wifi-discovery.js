@@ -151,12 +151,20 @@ async function discover ({ adbPath, port = 5555, timeout = 260 } = {}) {
   const mdnsPromise = mdnsDevices(adbPath)
 
   /**
-   * 网段按优先级逐个扫，命中即停。
-   * 之前是所有网段并行扫完再合并（约 3.3s），而实际手机在 WLAN 段，
-   * 第一个网段就开始命中，后面那些（以太网/虚拟网卡）纯属浪费时间。
+   * 网段并行扫（最多同时 3 个 /24）。
+   *
+   * 之前是串行：第一个网段没命中就等它 1.5 秒扫完再扫下一个 ——
+   * 手机不在 WiFi 上时要等 4.5 秒（实测），用户以为卡住了。
+   * 现在并行：总耗时 = 最慢的那个（~1.5 秒），命中后其余结果直接丢弃。
+   *
+   * 并发上限 3：每个 /24 内部已经 96 并发，3 个就是 288 个 socket，
+   * 家用路由器扛得住；再多就有把网关打爆的风险。
    */
-  for (const s of subnets) {
-    const hits = await scanSubnet(s.base, port, { timeout })
+  const toScan = subnets.slice(0, 3)
+  const results = await Promise.all(
+    toScan.map(s => scanSubnet(s.base, port, { timeout }).catch(() => []))
+  )
+  for (const hits of results) {
     if (!hits.length) continue
     hits.forEach(h => add(h.host, h.port, 'scan', { ms: h.ms }))
     break
