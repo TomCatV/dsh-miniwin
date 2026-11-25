@@ -924,6 +924,23 @@ async function startScrcpySession (opts = {}) {
   const adb = new Adb(adbPath())
 
   /**
+   * ══════════ adbd 重启闸门：从函数一开始就关上 ══════════
+   *
+   * 原来这个闸门只在 cap.start() 前一刻才关，于是整段「探设备 / 读属性 /
+   * 预热 WiFi」的窗口是敞开的 —— 期间任何一处触发 `adb tcpip 5555`
+   * （它**重启 adbd**），都会在 scrcpy 刚 push 完 server 时把连接打死：
+   * 一个字节也写不出来 → 35 秒后判「管道连接超时」。
+   *
+   * 实测 WiFi 通道每次都要重试一次才好，根因就在这个窗口。
+   * 现在从进函数起就禁止重启 adbd；cap.start() 那处保留作为重复保险。
+   *
+   * 防呆：万一中途抛异常没走到 cap.start() 的 finally，90 秒后自动放开，
+   * 免得永久锁死 adbd 重启能力。
+   */
+  captureStarting = true
+  setTimeout(() => { captureStarting = false }, 90000)
+
+  /**
    * ══════════ WiFi adb 自愈 ══════════
    *
    * adb 的 TCP 模式在手机重启后失效（adbd 回到 USB 模式），
@@ -994,13 +1011,24 @@ async function startScrcpySession (opts = {}) {
     logLine('ok', `使用 USB 通道（${usbDev.serial}）`)
 
     /**
-     * 后台把 WiFi 通道热好 —— 但走安全版：
-     * 采集期间绝不 `adb tcpip`（那会重启 adbd 把刚起来的 scrcpy 掐死）。
-     * 详见 prepareWifiBackup 顶部注释。
+     * 把 WiFi 通道热好 —— 但**必须等它做完**再去启动采集。
+     *
+     * 这里原来是 fire-and-forget（`;(async () => {…})()`），后果很隐蔽：
+     * prepareWifiBackup 内部可能跑 `adb tcpip 5555`，而那是**重启 adbd**。
+     * 如果它在 scrcpy 正在 push server / 刚连上的那几秒里落地，
+     * 采集端就会「一个字节都写不出来」，35 秒后判「管道连接超时」——
+     * 用户看到的正是「WiFi 连不上」。实测这台机器上 WiFi 通道每次都要
+     * 重试一次才好，根因就是这个竞态。
+     *
+     * 现在改成阻塞等待，但加 4 秒上限：手机重启后第一次插线最多多等 4 秒，
+     * 换来的是采集不再被自己人打死。
      */
-    ;(async () => {
-      try { await prepareWifiBackup(keeper, usbDev.serial, 'start') } catch {}
-    })()
+    try {
+      await Promise.race([
+        prepareWifiBackup(keeper, usbDev.serial, 'start'),
+        new Promise(res => setTimeout(res, 4000))
+      ])
+    } catch {}
   } else if (wifiDev) {
     chosen = wifiDev.serial
     logLine('info', `没有 USB，使用 WiFi 通道（${wifiDev.serial}）`)
@@ -1106,19 +1134,55 @@ async function startScrcpySession (opts = {}) {
 
   const capMaxSize = tier.maxSize
   const capFps = Math.min(tier.fps, 60)
-  const capBitRate = tier.bitRate
+  /**
+   * ══════════ WiFi 通道必须压码率 ══════════
+   *
+   * 实测（HBN-AL00）：
+   *   原生档 1260×2844 @16Mbps 走 USB 没问题；
+   *   同样的参数走 WiFi，scrcpy 的编码器被套接字反压卡住 ——
+   *   35 秒一个字节都没写进管道，然后被判「管道连接超时」。
+   *   用户看到的是「WiFi 连不上」，其实设备连得好好的。
+   *
+   * 降到 1080/8M 后立刻正常：3.0 秒出首帧，10 秒 248 帧。
+   *
+   * 所以 WiFi 通道把长边压到 ≤1080、码率压到 ≤8M，并在日志里写明原因，
+   * 免得用户以为画质是自己设错了。
+   */
+  const isWifiTransport = /:\d+$/.test(String(dev.serial || ''))
+  const WIFI_MAX_SIZE = 1080
+  const WIFI_MAX_BITRATE = 8 * 1000 * 1000
 
-  const estShort = Math.max(1, Math.round(capMaxSize * nativeAspect))
+  function parseBitRate (s) {
+    const m = /^(\d+(?:\.\d+)?)([KMG])$/i.exec(String(s || '').trim())
+    if (!m) return 0
+    const n = Number(m[1])
+    const unit = m[2].toUpperCase()
+    return Math.round(n * (unit === 'K' ? 1e3 : unit === 'M' ? 1e6 : 1e9))
+  }
+  function formatBitRate (bps) {
+    if (bps >= 1e6) return Math.round(bps / 1e6) + 'M'
+    return Math.round(bps / 1e3) + 'K'
+  }
+
+  const wifiCapped = isWifiTransport &&
+    (capMaxSize > WIFI_MAX_SIZE || parseBitRate(tier.bitRate) > WIFI_MAX_BITRATE)
+  const capBitRate = isWifiTransport
+    ? formatBitRate(Math.min(parseBitRate(tier.bitRate) || WIFI_MAX_BITRATE, WIFI_MAX_BITRATE))
+    : tier.bitRate
+  const finalMaxSize = isWifiTransport ? Math.min(capMaxSize, WIFI_MAX_SIZE) : capMaxSize
+
+  const estShort = Math.max(1, Math.round(finalMaxSize * nativeAspect))
   logLine('info',
     `画质档位：${tier.name}（${tier.id}）` +
-    ` → 约 ${estShort}×${capMaxSize} · ${capBitRate} · ${capFps}fps` +
-    (nativeLongSide !== tierRaw.maxSize ? `（已按手机原生长边 ${nativeLongSide} 收敛）` : ''))
+    ` → 约 ${estShort}×${finalMaxSize} · ${capBitRate} · ${capFps}fps` +
+    (nativeLongSide !== tierRaw.maxSize ? `（已按手机原生长边 ${nativeLongSide} 收敛）` : '') +
+    (wifiCapped ? '｜WiFi 通道自动压到 1080/8M（原档位会卡死编码器）' : ''))
 
   const cap = new ScrcpyCapture({
     scrcpy: SCRCPY_EXE,
     adb: adbPath(),
     serial: dev.serial,
-    maxSize: capMaxSize,
+    maxSize: finalMaxSize,
     bitRate: capBitRate,
     maxFps: capFps
   })

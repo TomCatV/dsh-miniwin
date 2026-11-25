@@ -169,6 +169,19 @@ class ScrcpyCapture {
   async start () {
     if (this.running) return { ok: true }
 
+    /**
+     * 第一次尝试之前**先清一次手机侧残留**。
+     *
+     * 原来只在失败重试时才清，代价是：上一次会话的 scrcpy-server 被强杀后，
+     * MediaCodec 归还硬编码器是异步的（500~1000ms），新 server 抢不到，
+     * 一个字节都不写 —— 用户干等 35 秒看到「管道连接超时」，然后重试瞬间成功。
+     *
+     * 实测 WiFi 通道下这条路径几乎每次都要走一遍。提前清一次 + 等 250ms，
+     * 第一次就能起来。
+     */
+    try { await this._killPhoneServer() } catch {}
+    await new Promise(res => setTimeout(res, 250))
+
     let r = await this._startOnce()
     if (r.ok) return r
 
@@ -295,7 +308,13 @@ class ScrcpyCapture {
         const s = d.toString().trim()
         if (!s) return
         // 只报关键信息，避免刷屏
-        if (/error|warn|fail/i.test(s)) this.log('[scrcpy] ' + s.slice(0, 160))
+        /**
+         * 默认只报 error/warn/fail，避免刷屏；
+         * 排查时设 MINIWIN_DEBUG_SCRCPY=1 打印全部。
+         */
+        if (process.env.MINIWIN_DEBUG_SCRCPY || /error|warn|fail/i.test(s)) {
+          this.log('[scrcpy] ' + s.slice(0, 220))
+        }
       })
       /**
        * scrcpy 退出 —— 这里必须上报，不能只是置个 flag。

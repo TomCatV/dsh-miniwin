@@ -27,22 +27,44 @@ function run (file, args, timeout = 8000) {
   })
 }
 
-/** 本机所有可用于局域网通信的 IPv4 /24 网段（排除虚拟网卡常见段） */
+/**
+ * 本机所有可用于局域网通信的 IPv4 /24 网段。
+ *
+ * ── 必须只留私有网段 ──
+ *
+ * 实测这台机器上有个虚拟网卡拿到了 28.0.0.x 这种**公网地址**，
+ * 旧代码把它也当 /24 扫了 —— adb 里于是多出
+ * `28.0.0.254:5555 offline` 这种垃圾条目，把「有没有设备」的判断
+ * 搅乱，还白扫 256 个陌生地址。
+ *
+ * 现在只认 RFC1918（10/8、172.16/12、192.168/16），虚拟网卡一律跳过，
+ * WLAN 排在最前。
+ */
+const VIRTUAL_IF = /vEthernet|VMware|VirtualBox|WSL|Hyper-V|Loopback|Npcap|TAP|TUN|Clash|代理|虚拟/i
+const WIFI_IF = /WLAN|Wi-Fi|无线/i
+const ETH_IF = /^(以太网|Ethernet|Local Area)/i
+
+function isPrivateIPv4 (ip) {
+  return /^10\./.test(ip) ||
+    /^192\.168\./.test(ip) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(ip)
+}
+
 function localSubnets () {
   const out = []
   const ifaces = os.networkInterfaces()
   for (const [name, list] of Object.entries(ifaces)) {
+    if (VIRTUAL_IF.test(name)) continue
     for (const a of list || []) {
       if (a.family !== 'IPv4' || a.internal) continue
       if (/^169\.254\./.test(a.address)) continue
-      // WSL / Hyper-V / VPN 虚拟网段：扫了也没手机，跳过以省时间
-      if (/^172\.(1[7-9]|2[0-9]|3[01])\./.test(a.address) && !/WLAN|Wi-Fi|无线/i.test(name)) continue
-      if (/^10\.8\./.test(a.address)) continue
+      if (!isPrivateIPv4(a.address)) continue
       const base = a.address.split('.').slice(0, 3).join('.')
-      out.push({ iface: name, address: a.address, base })
+      const score = WIFI_IF.test(name) ? 100 : (ETH_IF.test(name) ? 50 : 10)
+      out.push({ iface: name, address: a.address, base, score })
     }
   }
-  out.sort((x, y) => (/WLAN|Wi-Fi|无线/i.test(y.iface) ? 1 : 0) - (/WLAN|Wi-Fi|无线/i.test(x.iface) ? 1 : 0))
+  out.sort((x, y) => y.score - x.score)
   return out
 }
 
