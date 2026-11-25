@@ -24,6 +24,41 @@
  * 编码器组装好），帧头格式对齐 ScrcpyParser 期望的 stage，所以这里直接
  * 复用 ScrcpyParser 解析 + frameToAvcc 转换 + 现有迷你窗渲染。
  */
+/**
+ * 本机局域网 IP —— 配对页要把它拼进深链里给手机用。
+ *
+ * 原来页面收的是 state.lanIp，而那个字段**从来没有被赋值过**，
+ * 于是深链写成 miniwin://stream?host=本机，手机点了一点反应都没有。
+ */
+let _lanIpCache = null
+function pickLanIp () {
+  if (_lanIpCache) return _lanIpCache
+  try {
+    const os = require('node:os')
+    const VIRTUAL = /vEthernet|VirtualBox|VMware|WSL|Loopback|Npcap|Hyper-V|虚拟|TAP|代理/i
+    const WIFI = /^(WLAN|Wi-?Fi|无线)/i
+    const ETH = /^(以太网|Ethernet|Local Area)/i
+    const scored = []
+    for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
+      if (!addrs || VIRTUAL.test(name)) continue
+      for (const a of addrs) {
+        if (a.family !== 'IPv4' && a.family !== 4) continue
+        const ip = a.address
+        if (ip.startsWith('127.') || ip.startsWith('169.254.')) continue
+        let s = 0
+        if (WIFI.test(name)) s += 100
+        else if (ETH.test(name)) s += 50
+        if (/^172\.(1[6-9]|2\d|3[01])\./.test(ip)) s += 10
+        else if (/^192\.168\./.test(ip)) s += 8
+        else if (/^10\./.test(ip)) s += 3
+        scored.push({ ip, s })
+      }
+    }
+    scored.sort((x, y) => y.s - x.s)
+    _lanIpCache = scored.length ? scored[0].ip : null
+  } catch { _lanIpCache = null }
+  return _lanIpCache
+}
 const http = require('http')
 const net = require('net')
 const { ScrcpyParser } = require('./streamer.js')
@@ -532,7 +567,7 @@ const httpServer = http.createServer((req, res) => {
   /** 配对页（手机扫码后打开的页面，GET） */
   if (u.pathname === '/pair' && req.method === 'GET') {
     const { pairPageHtml } = require('./pair-page.js')
-    const html = pairPageHtml(state.lanIp || '本机', LISTEN_PORT + 2)
+    const html = pairPageHtml(pickLanIp() || '本机', HTTP_PORT, LISTEN_PORT)
     const buf = Buffer.from(html, 'utf8')
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': String(buf.length), 'Cache-Control': 'no-store' })
     res.end(buf)

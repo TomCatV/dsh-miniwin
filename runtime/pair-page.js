@@ -9,10 +9,16 @@
  * 用户看到的现象就是「纯 WiFi 连不上」：二维码扫开是空白，随后连 APK
  * 推流也一起断了（同一个进程）。
  *
- * 现在的实现：一张自包含的页面，不依赖任何外网资源。
- *   ① 无线调试配对（Android 11+）：填「IP:端口」+ 6 位配对码 → POST /pair
- *   ② 配对成功后自动 POST /start-zero 起传输
- *   ③ 上面两条走不通时，页面直接给出 APK 下载入口（走 App 推流那条路）
+ * ── 页面给谁看 ──
+ *
+ * 手机浏览器/相机扫到 PC 面板上的码，落在这个页面上。三种人：
+ *   1. 已经装了 App        → 点绿色按钮（miniwin:// 深链）直接开投
+ *   2. 还没装 App          → 下载 APK，装完回来点绿色按钮
+ *   3. Android 11+ 不想装  → 用无线调试配对（IP:端口 + 6 位码）
+ *
+ * 第 1 条是关键：APK 的主按钮**不再拉起扫码器**（作者的原话是
+ * 「码呢，手机上扫码我扫你妈」），它只能被 adb 或浏览器深链拉起。
+ * 所以纯 WiFi、没有 adb 的场景里，这个按钮是唯一入口。
  */
 
 function esc (s) {
@@ -22,19 +28,25 @@ function esc (s) {
 }
 
 /**
- * @param {string} lanIp  PC 的局域网 IP（页面会用到）
- * @param {number} port   接收端 HTTP 端口（页面里的请求都打自己所在的 origin）
+ * @param {string} lanIp    PC 的局域网 IP
+ * @param {number} httpPort 本页所在的 HTTP 端口（只用于显示）
+ * @param {number} recvPort 手机 App 要推流的 TCP 端口（深链里的 port）
  */
-function pairPageHtml (lanIp, port) {
+function pairPageHtml (lanIp, httpPort, recvPort) {
   const ip = esc(lanIp)
-  const p = Number(port) || 0
+  const hp = Number(httpPort) || 0
+  const rp = Number(recvPort) || 0
+  const deepLink = rp
+    ? `miniwin://stream?host=${encodeURIComponent(String(lanIp))}&port=${rp}&maxSize=1080`
+    : ''
+
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0b0e14">
-<title>MiniWin 投屏配对</title>
+<title>MiniWin 投屏</title>
 <style>
   :root{color-scheme:dark}
   *{box-sizing:border-box}
@@ -52,6 +64,9 @@ function pairPageHtml (lanIp, port) {
   button{width:100%;margin-top:14px;padding:13px;border:0;border-radius:11px;
     background:linear-gradient(180deg,#4a90f8,#2b6fe0);color:#fff;font:600 15px/1 inherit;letter-spacing:.02em}
   button:disabled{opacity:.5}
+  .big{display:block;width:100%;margin-top:6px;padding:15px;border-radius:12px;text-align:center;
+    background:linear-gradient(180deg,#3ddc84,#1fae63);color:#06210f;font:700 16px/1 inherit;
+    text-decoration:none;letter-spacing:.02em}
   .alt{margin-top:12px;padding:13px;border-radius:11px;border:1px solid rgba(255,255,255,.14);
     background:transparent;color:#a9ccff;font-weight:600;text-align:center;display:block;text-decoration:none}
   .hint{font-size:12px;color:rgba(233,235,242,.45);margin-top:8px}
@@ -62,23 +77,28 @@ function pairPageHtml (lanIp, port) {
 </style>
 </head>
 <body>
-  <h1>MiniWin 投屏配对</h1>
-  <div class="sub">电脑：<span class="ip">${ip}${p ? ':' + p : ''}</span></div>
+  <h1>MiniWin 投屏</h1>
+  <div class="sub">电脑：<span class="ip">${ip}${hp ? ':' + hp : ''}</span></div>
 
   <div class="card">
-    <h2>方式一 · 无线调试配对（Android 11+）</h2>
+    <h2>已经装了 App</h2>
+    <a class="big" href="${esc(deepLink)}">开始投屏</a>
+    <div class="hint">点一下会直接打开手机上的 MiniWin 投屏，画面马上到电脑上。</div>
+  </div>
+
+  <div class="card">
+    <h2>还没装 App</h2>
+    <a class="alt" href="/app.apk">下载 MiniWin 投屏 APK</a>
+    <div class="hint">装好后回到这个页面，点上面的绿色按钮。</div>
+  </div>
+
+  <div class="card">
+    <h2>无线调试配对（Android 11+，不用装 App）</h2>
     <label>配对地址（手机：开发者选项 → 无线调试 → 使用配对码配对设备）</label>
     <input id="addr" placeholder="192.168.1.23:38571" autocapitalize="off" autocomplete="off" spellcheck="false">
     <label>6 位配对码</label>
     <input id="code" placeholder="123456" inputmode="numeric" maxlength="6" autocomplete="one-time-code">
     <button id="go">配对并开始投屏</button>
-    <div class="hint">配对成功后手机会被 adb 接管，电脑上的迷你窗会自己亮起来。</div>
-  </div>
-
-  <div class="card">
-    <h2>方式二 · 装 App（任何安卓版本都行）</h2>
-    <a class="alt" href="/app.apk">下载 MiniWin 投屏 APK</a>
-    <div class="hint">装好后点开 App，它会把画面和声音直接推给这台电脑，不需要 adb。</div>
   </div>
 
   <div id="msg" class="msg"></div>
