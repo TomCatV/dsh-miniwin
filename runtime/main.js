@@ -3152,6 +3152,79 @@ async function bootWindow () {
   win.webContents.on('did-finish-load', () => { replayStateToRenderer() })
 
   /**
+   * ══════════ WiFi 模式：把流地址交给渲染层 ══════════
+   *
+   * 这里曾经是个致命缺口：`--wifi <url>` 解析出来了，却**从来没有人把它
+   * 发给渲染层** —— ui.html 里的 `onWifiStart` 监听器永远等不到事件，
+   * 于是 WiFi 模式下窗口就是一块占位图，用户看到的是「连不上」。
+   *
+   * 现在每次加载完成都发一次（页面重载后也能自己恢复），
+   * 渲染层收到就开始长轮询 /frames 拉画面 + 起 WifiAudio 播放声音。
+   */
+  if (wifiSource) {
+    const sendWifiStart = () => {
+      if (!win || win.isDestroyed()) return
+      try {
+        win.webContents.send('wifi:start', { source: wifiSource })
+        logLine('info', '[wifi] 已通知渲染层拉流: ' + wifiSource)
+      } catch (e) { logLine('warn', '[wifi] 通知渲染层失败: ' + e.message) }
+    }
+    win.webContents.on('did-finish-load', sendWifiStart)
+    sendWifiStart()
+    /**
+     * 首帧加载时的竞态：bootWindow() 是 await loadFile 回来的，此时
+     * did-finish-load 已经过去，而渲染层的监听器可能刚注册完 —— 一条事件
+     * 丢了就是「窗口一直空白」。补两次延迟发送，渲染层用 wifiRunning 去重，
+     * 多发无害。
+     */
+    setTimeout(sendWifiStart, 700)
+    setTimeout(sendWifiStart, 2200)
+
+    /**
+     * WiFi 模式下的音频策略。
+     *
+     * 复用同一套 AudioRouter：
+     *   · 有 adb 通道 → 能识别耳机，完整规则生效
+     *   · 没有 adb   → 耳机不可知，按外放处理（投屏音量默认 0，
+     *                   手机端由 APK 自己锁 0），手机音量键仍能遥控投屏音量
+     * 投屏音量 = 渲染层本地增益，永远不会写回手机。
+     */
+    ;(async () => {
+      try {
+        const { AudioRouter } = require('./audio-router.js')
+        let serial = null
+        try {
+          const adb = new Adb(adbPath())
+          const list = await adb.devices()
+          const ready = list.filter(d => d.state === 'device')
+          if (ready.length) serial = ready[0].serial
+        } catch {}
+        const httpPort = (() => {
+          try { return Number(new URL(wifiSource).port) || 0 } catch { return 0 }
+        })()
+        const router = new AudioRouter({
+          adb: adbPath(),
+          serial,
+          httpPort,
+          apkPackage: 'com.miniwin.stream',
+          onLog: (m) => logLine('info', m),
+          onState: (st) => { try { win && win.webContents.send('audio:state', st) } catch {} }
+        })
+        await router.poll()
+        router.setPcVolume(0)
+        router.start()
+        app.on('will-quit', () => { try { router.stop() } catch {} })
+        logLine(serial ? 'info' : 'warn',
+          serial
+            ? '[audio] WiFi 模式：音频策略已接管，能识别耳机（' + serial + '）'
+            : '[audio] WiFi 模式：没有 adb 通道，耳机状态无法探测，按外放处理（投屏音量默认 0）')
+      } catch (e) {
+        logLine('warn', '[audio] WiFi 模式音频策略初始化失败: ' + e.message)
+      }
+    })()
+  }
+
+  /**
    * ══════════ Esc 只在窗口有焦点时才退出 ══════════
    *
    * 踩过的坑：原来是 globalShortcut.register('Escape', ...)。

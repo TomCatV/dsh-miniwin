@@ -37,8 +37,9 @@ class AudioRouter {
   }
 
   _run (args, timeout = 8000) {
+    const full = this.serial ? ['-s', this.serial, ...args] : args
     return new Promise((resolve) => {
-      execFile(this.adb, ['-s', this.serial, ...args], { timeout, windowsHide: true },
+      execFile(this.adb, full, { timeout, windowsHide: true },
         (err, stdout, stderr) => resolve({ ok: !err, out: String(stdout || ''), err: String(stderr || '') }))
     })
   }
@@ -55,8 +56,17 @@ class AudioRouter {
   }
 
   async poll () {
-    const { out } = await this._run(['shell', 'dumpsys audio'])
-    const p = AudioRouter.parse(out)
+    /**
+     * 没有 adb 通道时（纯 WiFi、手机没开 tcpip 也没插线），
+     * 拿不到 dumpsys —— 这时候不能盲判成「外放」把手机静音掉。
+     * 我们只保留「/meta 的手机音量」这一路，headset 记为未知(false)，
+     * 由上层决定降级行为；投屏侧音量仍然默认 0。
+     */
+    let p = { devices: [], streamVolume: 0 }
+    if (this.serial) {
+      const { out } = await this._run(['shell', 'dumpsys audio'])
+      p = AudioRouter.parse(out)
+    }
     const headset = p.devices.some(d => HEADSET_DEVICES.includes(d))
     const speaker = p.devices.some(d => SPEAKER_DEVICES.includes(d))
 
@@ -128,6 +138,7 @@ class AudioRouter {
 
   /** 规则 2：外放时连接即双端静音（用音量键把媒体音量降到 0） */
   async mutePhone () {
+    if (!this.serial) return
     // `cmd media_session` 一条命令就能把媒体音量设到 0，比连按音量键干净得多
     const r = await this._run(['shell', 'cmd media_session volume --stream 3 --set 0'])
     if (r.ok) {
@@ -150,6 +161,8 @@ class AudioRouter {
    * 不 force-stop 的话耳机里也没声。
    */
   async killApk () {
+    /** 没有 adb 通道（纯 WiFi）时做不到，直接跳过 —— 别让 adb 报「no devices」刷屏 */
+    if (!this.serial) return
     await this._run(['shell', `am force-stop ${this.apkPackage}`])
     this.onLog(`[audio] 已停止手机端 ${this.apkPackage}`)
   }
