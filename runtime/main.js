@@ -2406,8 +2406,21 @@ ipcMain.on('win:video-size', (_e, d) => {
 
   // 控制事件要把鼠标坐标换算到手机像素，得知道视频的真实分辨率。
   // 这里是最早能拿到该值的地方，顺手同步给控制器。
+  const sizeChanged = (lastVideoW !== d.w || lastVideoH !== d.h)
   lastVideoW = d.w
   lastVideoH = d.h
+  /**
+   * 顺手把真实分辨率报给 DSH 侧边栏。
+   *
+   * 面板上的 state.videoSize 一直是 null：唯一来源是解码器配置时的
+   * info.width/info.height，而它们取自 MKV 头部 —— 这台手机上头部不带
+   * 像素尺寸（实测 0x0），于是 info.width > 0 永远不成立，一次都没推过。
+   *
+   * 渲染层画第一帧时能拿到 VideoFrame.displayWidth/Height，那才是真值。
+   */
+  if (sizeChanged) {
+    try { pushStatus({ videoSize: { w: d.w, h: d.h } }) } catch {}
+  }
   if (ctrl && ctrl.ready) ctrl.setScreen(d.w, d.h)
 
   const ratio = d.w / d.h                 // 竖屏约 0.44
