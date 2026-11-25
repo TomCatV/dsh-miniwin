@@ -896,7 +896,14 @@ async function waitForPhone (keeper, o = {}) {
         const span = timeoutMs < 60000
           ? `${Math.max(1, Math.round(timeoutMs / 1000))} 秒`
           : `${Math.round(timeoutMs / 60000)} 分钟`
-        const msg = `正在等手机上线…（手机没开 adb 监听时最长等 ${span}，插一次 USB 会立刻连上）`
+        /**
+         * 等待文案。
+         *
+         * 断线重连时不能说「插一次 USB」那套 —— 用户刚拔线，
+         * 真正该做的是插回去重新开无线调试，所以调用方会传 o.hint 覆盖。
+         */
+        const msg = o.hint ||
+          `正在等手机上线…（手机没开 adb 监听时最长等 ${span}，插一次 USB 会立刻连上）`
         logLine('info', msg)
         pushStatus({ phase: 'connecting', hint: msg })
       }
@@ -965,10 +972,44 @@ async function startScrcpySession (opts = {}) {
   })
 
   // 先探一次当前状态（同步拿结果，不用等守护循环）
-  const devs0 = await keeper.devices()
+  let devs0 = await keeper.devices()
+
+  /**
+   * ══════════ 拔线后 WiFi 是 offline 的，得先救活 ══════════
+   *
+   * 实测（用户拔线后的日志）：
+   *   [scrcpy] ERROR: Device could not be connected (state=offline)
+   *   ERROR: Server connection failed
+   *
+   * usb 一拔，adb 表里那条 `ip:5555` 不会消失，而是变成 **offline**。
+   * 旧代码还把它当可用设备选中，于是三次重试全打在一条死连接上，
+   * 用户看到的就是「卡住不动」。
+   *
+   * 所以：只要表里有 WiFi 条目但都不是 device，就先 `adb connect` 一次
+   * （缓存 IP 或条目里的 IP），再重读设备表。
+   */
+  const liveOf = (list) => (list || []).filter(d => d.state === 'device')
+  if (!liveOf(devs0).some(d => d.isWifi)) {
+    const stale = (devs0 || []).find(d => d.isWifi)
+    const ip = (stale && String(stale.serial).split(':')[0]) ||
+      (/^\d+\.\d+\.\d+\.\d+$/.test(String(st.lastPhoneIp || '')) ? st.lastPhoneIp : '')
+    if (ip) {
+      try {
+        logLine('info', `[wifi] adb 里那条 ${ip}:5555 是 offline，主动重连一次…`)
+        const a0 = new Adb(adbPath())
+        const r0 = await a0.connectWifi(ip, 5555)
+        logLine('info', `[wifi] 重连结果: ${(r0 && (r0.stdout || r0.message)) || 'ok'}`)
+        await new Promise(res => setTimeout(res, 600))
+        devs0 = await keeper.devices()
+      } catch (e) {
+        logLine('warn', '[wifi] 重连失败: ' + e.message)
+      }
+    }
+  }
+
   let chosen = null
-  const wifiDev = devs0.find(d => d.isWifi)
-  const usbDev = devs0.find(d => !d.isWifi)
+  const wifiDev = devs0.find(d => d.isWifi && d.state === 'device')
+  const usbDev = devs0.find(d => !d.isWifi && d.state === 'device')
 
   /**
    * ══════════ 通道优先级：USB > WiFi ══════════
@@ -998,7 +1039,7 @@ async function startScrcpySession (opts = {}) {
    * tcpip + connect），这样用户拔线时能立刻无缝切过去，
    * 而不是等重连逻辑慢慢探测。
    */
-  if (opts.serial && devs0.some(d => d.serial === opts.serial)) {
+  if (opts.serial && devs0.some(d => d.serial === opts.serial && d.state === 'device')) {
     chosen = opts.serial
   } else if (usbDev) {
     /**
@@ -1058,8 +1099,29 @@ async function startScrcpySession (opts = {}) {
    *   ④ 超时（默认 3 分钟）才真正报错，并把可操作的原因写清楚
    */
   if (!chosen) {
-    // 不传 timeoutMs —— 让 waitForPhone 自己按 --wait-ms / 环境变量 / 默认 3 分钟决定
-    chosen = await waitForPhone(keeper, { intervalMs: 3000 })
+    /**
+     * 等多久？
+     *
+     * 首次启动可以等满（用户可能正在插线），但**断线自动重连不能等 3 分钟**：
+     * 用户拔掉 USB 之后如果 WiFi 没就绪，界面会静默卡住 3 分钟 ——
+     * 这正是「拔掉了，你看下卡了」那个现象。
+     *
+     * 重连时最多等 15 秒，并把可操作的原因直接写进提示条。
+     */
+    const waitMs = opts.reconnect ? 15000 : undefined
+    if (opts.reconnect) {
+      pushStatus({
+        phase: 'connecting',
+        hint: 'USB 已断开，WiFi 通道没就绪：插回 USB 一次即可重新开启无线调试'
+      })
+    }
+    chosen = await waitForPhone(keeper, {
+      intervalMs: 3000,
+      timeoutMs: waitMs,
+      hint: opts.reconnect
+        ? 'USB 已断开，WiFi 通道没就绪：插回 USB 一次即可重新开启无线调试'
+        : null
+    })
     if (chosen) {
       /**
        * 只有 WiFi 地址才记 lastPhoneIp。
@@ -1272,7 +1334,7 @@ async function startScrcpySession (opts = {}) {
       try {
         // 重新走一遍完整启动（含设备发现 + 手机端清理）
         suppressReconnect = false
-        await startSession({})
+        await startSession({ reconnect: true })
         logLine('ok', `重连成功（第 ${reconnectAttempts} 次）`)
         reconnectAttempts = 0
       } catch (e) {
