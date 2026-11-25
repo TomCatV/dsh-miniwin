@@ -2984,6 +2984,23 @@ window.api.onWifiStart(({ source }) => {
   addLocalLog('info', 'WiFi 模式启动: ' + source)
 
   /**
+   * WiFi（APK 推流）模式的占位文案。
+   *
+   * 默认文案是给 adb 那条路写的（「正在等手机上线…最长 3 分钟」），
+   * 但这条路**完全不碰 adb**：手机只要打开 App 就会自己推过来。
+   * 用户看到那句「等 3 分钟」只会觉得程序坏了 —— 用户的质疑：
+   * 「都连 wifi 了你还要用户等 3 分钟」。
+   */
+  try {
+    const ph = $('placeholder')
+    if (ph) {
+      $('phTitle').textContent = '等待手机推流…'
+      $('phBody').textContent = '在手机上打开 MiniWin 投屏 App（或扫侧边栏的二维码），画面会自动出现'
+      ph.style.display = 'flex'
+    }
+  } catch {}
+
+  /**
    * 启动音频（与视频并行，互不阻塞）。
    *
    * ── 为什么要重试 ──
