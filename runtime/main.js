@@ -1415,6 +1415,31 @@ async function startScrcpySession (opts = {}) {
       } catch (e) {
         logLine('warn', `第 ${reconnectAttempts} 次重连失败: ${e.message}`)
         reconnecting = false
+
+        /**
+         * 重连失败的最后一招：切到 App 推流。
+         *
+         * 没有 adb 通道时继续退避重试只是耗时间（用户看到的就是「卡了」）。
+         * 接收端不依赖 adb，拉起来就能把画面接回去；手机上的 App 只要在跑
+         * 就继续投。插回 USB 后由通道守护切回 scrcpy 高清。
+         */
+        const httpPort = await ensureFallbackReceiver()
+        if (httpPort) {
+          try {
+            if (win && !win.isDestroyed()) {
+              win.webContents.send('wifi:start', { source: 'http://127.0.0.1:' + httpPort })
+            }
+            logLine('ok', `[fallback] adb 通道不可用 → 已切到 App 推流（127.0.0.1:${httpPort}）`)
+            pushStatus({
+              phase: 'connecting',
+              hint: '已切到 App 推流模式：确认手机上 MiniWin 投屏在运行（插回 USB 可切回高清）'
+            })
+            return
+          } catch (err) {
+            logLine('warn', '[fallback] 切换渲染层失败: ' + err.message)
+          }
+        }
+
         scheduleReconnect('重连失败')
         return
       } finally {
@@ -2081,6 +2106,8 @@ async function startScrcpySession (opts = {}) {
   let usbSeenFor = 0
   /** 上次尝试唤醒 WiFi 的时间（节流，避免每 1.5 秒刷一次） */
   let lastWakeAt = 0
+  /** 是否已经切到 App 推流兜底（避免重复发 wifi:start） */
+  let apkFallbackOn = false
 
   const transportTimer = setInterval(async () => {
     if (!session || session.serial !== mySerial) return
@@ -2156,7 +2183,39 @@ async function startScrcpySession (opts = {}) {
         }
       }
 
-      if (!target) return
+      /**
+       * ══════════ 兜底：切到 App 推流（不需要 adb）══════════
+       *
+       * 这台手机上「纯 WiFi 走 adb」靠不住：一拔线 adbd 就重启，
+       * 5555 的监听跟着消失（实测 adb connect 直接 10061 拒绝）。
+       * 于是拔线后没有任何 adb 通道可切，窗口只能干等。
+       *
+       * 但接收端（App 推流）跟 adb 无关：手机上的 MiniWin 投屏 App
+       * 把画面推到电脑 43110，迷你窗从 43111 拉流。所以这里直接把
+       * 渲染层的流源切过去 —— 窗口不用重开，画面从 scrcpy 换到 App。
+       *
+       * 前提：接收端在跑（--with-audio 时由 AudioBridge 拉起）。
+       */
+      if (!target) {
+        const httpPort = session && session.audio && session.audio.httpPort
+        if (httpPort && !apkFallbackOn) {
+          apkFallbackOn = true
+          const src = 'http://127.0.0.1:' + httpPort
+          try {
+            if (win && !win.isDestroyed()) win.webContents.send('wifi:start', { source: src })
+            logLine('ok', `[fallback] adb 通道全部失效 → 切到 App 推流（${src}）`)
+            pushStatus({
+              phase: 'connecting',
+              hint: '已切到 App 推流模式：确认手机上 MiniWin 投屏在运行（插回 USB 可切回高清）'
+            })
+          } catch (e) {
+            logLine('warn', '[fallback] 切换失败: ' + e.message)
+          }
+        }
+        return
+      }
+      // 找到可用通道了：清掉兜底标记，下次断了还能再切回来
+      apkFallbackOn = false
 
       switchingTransport = true
       try {
@@ -3315,6 +3374,51 @@ function startControlServer (port) {
  *
  * 幂等：已经在跑就直接返回。
  */
+/**
+ * ══════════ App 推流兜底 ══════════
+ *
+ * 场景：USB 拔掉之后，这台华为的 adbd 直接重启，5555 的监听消失
+ * （实测 adb connect 立刻 10061 拒绝）。此时没有任何 adb 通道，
+ * scrcpy 那条路彻底走不了，窗口只能干等。
+ *
+ * 但 App 推流跟 adb 无关：手机上的 MiniWin 投屏把画面推到电脑 27190，
+ * 迷你窗从 27191 拉。所以这里单独拉一个**不属于会话**的接收端 ——
+ * 会话被 stopSession 拆掉也不会影响它 —— 然后把渲染层的流源切过去。
+ *
+ * 返回 HTTP 端口；失败返回 0。
+ */
+let fallbackAudio = null
+async function ensureFallbackReceiver () {
+  try {
+    if (fallbackAudio && fallbackAudio.httpPort) return fallbackAudio.httpPort
+    const { AudioBridge } = require('./audio-bridge.js')
+    const audio = new AudioBridge({
+      node: NODE_EXE,
+      receiverJs: path.join(__dirname, 'wifi-receiver.js'),
+      adb: adbPath(),
+      lanPort: 27190,
+      onLog: (m) => logLine('info', '[fallback] ' + m),
+      onConfig: (cfg) => {
+        if (win && !win.isDestroyed()) win.webContents.send('audio:config', { description: cfg.description })
+      },
+      onFrame: (buf, pts) => {
+        if (win && !win.isDestroyed()) win.webContents.send('audio:frame', { data: buf, pts })
+      },
+      onState: (st) => { if (st.waiting) logLine('info', '[fallback] 等待手机推流…') }
+    })
+    const r = await audio.startReceiver()
+    if (!r.ok) {
+      logLine('warn', '[fallback] 接收端启动失败: ' + (r.error || ''))
+      return 0
+    }
+    await audio.startPulling()
+    fallbackAudio = audio
+    return audio.httpPort
+  } catch (e) {
+    logLine('warn', '[fallback] 接收端异常: ' + e.message)
+    return 0
+  }
+}
 async function bootWindow () {
   if (win && !win.isDestroyed()) return win
 
