@@ -27,7 +27,23 @@ if (-not (Test-Admin)) {
 }
 
 Write-Host ''
-Write-Host '  扫描 ADB 接口…' -ForegroundColor Cyan
+Write-Host '  ① 清理残留的幽灵节点…' -ForegroundColor Cyan
+# 这台机器上每次拔插都会生成一个 USB\CLASS_CO&SUBCLASS_WI&PROT_ 的坏节点，
+# Windows 下次插上时会优先匹配它 → Status=Error → adb 看不到手机。
+# 这些节点 Present=False，删掉不影响正在用的设备。
+$phantoms = Get-PnpDevice -ErrorAction SilentlyContinue |
+  Where-Object { $_.FriendlyName -match 'ADB Interface' -and -not $_.Present }
+if ($phantoms) {
+  foreach ($p in $phantoms) {
+    Write-Host ("    删除 {0}" -f $p.InstanceId) -ForegroundColor Gray
+    & pnputil /remove-device "$($p.InstanceId)" | Out-Null
+  }
+} else {
+  Write-Host '    没有幽灵节点' -ForegroundColor Gray
+}
+
+Write-Host ''
+Write-Host '  ② 扫描 ADB 接口…' -ForegroundColor Cyan
 
 $targets = Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
   Where-Object { $_.FriendlyName -match 'ADB Interface' -or $_.Class -eq 'AndroidUsbDeviceClass' }
