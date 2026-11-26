@@ -1172,6 +1172,52 @@ async function startScrcpySession (opts = {}) {
     throw new Error(msg)
   }
 
+  /**
+   * ══════════ 选完先验活 ══════════
+   *
+   * adb 的条目会在 device / offline 之间抖（WiFi 上尤其明显）。直接拿一条
+   * offline 的 serial 去 spawn scrcpy，三轮全打在死连接上：
+   *
+   *   [scrcpy] ERROR: Device could not be connected (state=offline)
+   *   启动失败（管道连接超时）第 2/3 → 第 3/3 → 用户看到的就是「卡了」
+   *
+   * 所以连查两次（间隔 300ms）；不是 device 就唤醒一次；还不行就当「没设备」，
+   * 交给下面的等待逻辑，而不是硬着头皮起 scrcpy。
+   */
+  if (chosen) {
+    const isAlive = async () => {
+      try {
+        const list = await new Adb(adbPath()).devices()
+        return list.some(x => x.serial === chosen && x.state === 'device')
+      } catch { return false }
+    }
+    let alive = await isAlive()
+    if (!alive) { await new Promise(r => setTimeout(r, 300)); alive = await isAlive() }
+    if (!alive && /:\d+$/.test(String(chosen))) {
+      logLine('warn', `[preflight] ${chosen} 当前不是 device，先唤醒一次…`)
+      try {
+        const rv = await adbReviveWifi(chosen)
+        logLine('info', `[preflight] 唤醒结果：${rv.out || (rv.ok ? 'ok' : '失败')}`)
+      } catch {}
+      alive = await isAlive()
+    }
+    if (!alive) {
+      logLine('warn', `[preflight] ${chosen} 仍不可用，先不启动采集`)
+      chosen = null
+    }
+  }
+
+  if (!chosen) {
+    const waitMs = opts.reconnect ? 15000 : undefined
+    if (opts.reconnect) {
+      pushStatus({
+        phase: 'connecting',
+        hint: 'USB 已断开，WiFi 通道没就绪：插回 USB 一次即可重新开启无线调试'
+      })
+    }
+    chosen = await waitForPhone(keeper, { intervalMs: 3000, timeoutMs: waitMs, hint: opts.reconnect ? 'USB 已断开，WiFi 通道没就绪：插回 USB 一次即可重新开启无线调试' : null })
+  }
+
   // 用找到的 serial 选设备
   let dev
   try {
