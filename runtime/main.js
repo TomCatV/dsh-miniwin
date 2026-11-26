@@ -692,7 +692,7 @@ function logLine (level, msg) {
  */
 let sessionGen = 0
 
-async function stopSession () {
+async function stopSession (o = {}) {
   sessionGen++          // 打断可能在跑的 waitForPhone
   if (!session) return
   const s = session
@@ -720,7 +720,17 @@ async function stopSession () {
   try { if (s.adb) await s.adb.run(['reverse', '--remove-all']) } catch {}
   try { if (s.adb && s.port) await s.adb.removeForward(s.port) } catch {}
   // 音频路由：断开时停音频 + 杀掉手机端 APK（用户要求）
-  try { if (s.router) await s.router.teardown() } catch {}
+  /**
+   * keepApk：通道切换 / 断线兜底时保留手机端 App。
+   *
+   * 用户定的规则是「断开连接时把声音也断开、把手机端 APK 杀掉」，
+   * 但那条只适用于**用户主动停止**。切通道时如果把 App 杀了，
+   * 接下来要用的 App 推流兜底就没有源了（实测：兜底接收端起来了，
+   * 手机端却已经被 force-stop，一个字节都推不过来）。
+   */
+  if (!o.keepApk) {
+    try { if (s.router) await s.router.teardown() } catch {}
+  }
   pushStatus({ streaming: false })
   logLine('info', '会话已停止')
 }
@@ -1409,7 +1419,7 @@ async function startScrcpySession (opts = {}) {
       try {
         // 重新走一遍完整启动（含设备发现 + 手机端清理）
         suppressReconnect = false
-        await startSession({ reconnect: true })
+        await startSession({ reconnect: true, keepApk: true })
         logLine('ok', `重连成功（第 ${reconnectAttempts} 次）`)
         reconnectAttempts = 0
       } catch (e) {
@@ -2146,8 +2156,8 @@ async function startScrcpySession (opts = {}) {
           try {
             logLine('ok', `[switch] USB 回来了 → 切回 USB（${up.serial}），比 WiFi 稳`)
             pushStatus({ phase: 'connecting', hint: 'USB 已插入，正在切回 USB…' })
-            await stopSession()
-            await startSession({ serial: up.serial })
+            await stopSession({ keepApk: true })
+            await startSession({ serial: up.serial, keepApk: true })
           } catch (e) {
             logLine('warn', '[switch] 切回 USB 失败: ' + e.message)
           } finally { switchingTransport = false; usbSeenFor = 0 }
@@ -2222,8 +2232,8 @@ async function startScrcpySession (opts = {}) {
         const label = myIsWifi ? 'WiFi → USB' : 'USB → WiFi'
         logLine('ok', `[switch] 通道切换：${mySerial} → ${target}（${label}）`)
         pushStatus({ phase: 'connecting', hint: `已自动切换通道：${label}` })
-        await stopSession()
-        await startSession({ serial: target })
+        await stopSession({ keepApk: true })
+        await startSession({ serial: target, keepApk: true })
       } catch (e) {
         logLine('warn', '[switch] 切换失败: ' + e.message)
       } finally { switchingTransport = false }
@@ -2302,7 +2312,8 @@ async function startSession (opts = {}) {
   lastStartAt = Date.now()
   startLock = (async () => {
     try {
-      await stopSession()
+      // 切通道 / 断线重连时保留手机端 App（兜底要用它推流）
+      await stopSession({ keepApk: !!opts.keepApk })
       return await startScrcpySession(opts)
     } finally {
       startLock = null
