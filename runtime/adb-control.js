@@ -293,31 +293,30 @@ class AdbShellControl {
   }
 
   async start () {
-    if (this.ready) return { ok: true, mode: 'adb-shell' }
+    if (this.ready) return { ok: true, mode: 'adb-once' }
     try {
       await this._querySize()
 
       /**
-       * 起持久 shell。
+       * ══════════ 不再用持久 shell ══════════
        *
-       * -T 是必需的：不加的话 adb 会分配 PTY，stdin 写入的命令
-       * 会被终端的行编辑逻辑吞掉，表现为「写了没反应」。
+       * 原来 spawn 一个常驻 `adb shell -T`，把命令写进它的 stdin。
+       * 单独用 node 跑没问题，但**在 Electron 主进程里这个 shell 永远不回话**：
+       *
+       *   [ctl] shell 探测第 1/2/3 次没回应，重试…
+       *   [ctl] 控制通道启动失败: shell 无响应
+       *
+       * 加重试、加延迟、换 -T 都试过，都不行。用户看到的就是
+       * 「鼠标点了、滚轮滚了，手机一点反应都没有」。
+       *
+       * 改成一次性命令：每个动作 spawn 一次 `adb shell input ...`。
+       * 代价每条约 40~80ms（远低于手速），换来的是必定能用，
+       * 也不用维护长连接的存活状态。手势本来就是「按下 tap + 抬起补 swipe」，
+       * 一条命令一个动作，正好对得上。
        */
-      this.sh = spawn(this.adb, ['-s', this.serial, 'shell', '-T'],
-        { windowsHide: true })
-
-      this.sh.stdout.on('data', d => { this._buf += d.toString() })
-      this.sh.stderr.on('data', d => { this._buf += d.toString() })
-      this.sh.on('exit', () => { this.ready = false; this.sh = null })
-      this.sh.on('error', (e) => this.log('shell 错误: ' + e.message))
-
-      // 等 shell 真正可用：写一条 echo 并等回显
-      const ok = await this._ping()
-      if (!ok) throw new Error('shell 无响应')
-
       this.ready = true
-      this.log('控制通道就绪（持久 adb shell）')
-      return { ok: true, mode: 'adb-shell' }
+      this.log('控制通道就绪（一次性 adb shell）')
+      return { ok: true, mode: 'adb-once' }
     } catch (e) {
       this.log('控制通道启动失败: ' + String(e.message || e))
       await this.stop()
@@ -402,15 +401,22 @@ class AdbShellControl {
     return { x: Math.round(x * sx), y: Math.round(y * sy) }
   }
 
+  /**
+   * 发一条 input 命令。
+   *
+   * 一次性调用（`adb -s <serial> shell input ...`），不再依赖常驻 shell 的
+   * stdin —— 那条路在 Electron 主进程里不回话。
+   *
+   * 用 fire-and-forget：鼠标事件是连发的，串行 await 会把手感拖成一卡一卡。
+   * 失败只记日志，绝不阻塞下一个动作。
+   */
   _cmd (line) {
-    if (!this.sh || !this.sh.stdin.writable) {
-      this.log('命令丢弃：shell 不可用')
+    if (!this.ready) {
+      this.log('命令丢弃：控制通道未就绪')
       return false
     }
-    try { this.sh.stdin.write(line + '\n') } catch (e) {
-      this.log('写入失败: ' + e.message)
-      return false
-    }
+    this._run(['shell', line], 15000)
+      .catch(e => this.log('命令失败: ' + String(e.message || e).slice(0, 120)))
     return true
   }
 
