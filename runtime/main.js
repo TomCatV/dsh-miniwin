@@ -1788,7 +1788,17 @@ async function startScrcpySession (opts = {}) {
    * APK 侧在开始捕获时会把手机 STREAM_MUSIC 调到 0，
    * 所以手机不出声，声音只在电脑播放。
    */
-  if (process.argv.includes('--with-audio')) {
+  /**
+   * 耳机在场时**完全不启音频链路**。
+   *
+   * 之前只是"启动后再停掉"，但 AudioHealer 看到没声音就会用深链把 APK
+   * 重新拉起来 —— APK 一跑就把手机媒体音量锁 0，用户手动调大又被压回去
+   * （用户原话：「我调手机声音又自动给我强制改为0了」）。
+   *
+   * 根上解决：耳机连着就根本不起接收端、不起自愈、不碰 APK。
+   */
+  const headsetNow = !!(session.router && session.router.last && session.router.last.headset)
+  if (process.argv.includes('--with-audio') && !headsetNow) {
     try {
       const { AudioBridge } = require('./audio-bridge.js')
       const audio = new AudioBridge({

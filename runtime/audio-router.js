@@ -21,6 +21,9 @@ const HEADSET_DEVICES = ['headset', 'headphone', 'bt_a2dp', 'bt_a2dp_hp', 'bt_a2
   'bt_sco', 'bt_sco_hs', 'bt_sco_carkit', 'usb_headset']
 const SPEAKER_DEVICES = ['speaker', 'speaker_safe']
 
+/** 恢复音量时用的档位（0..15 里的中上档，耳机/外放都听得见） */
+const RESTORE_VOLUME = 8
+
 class AudioRouter {
   constructor (opts = {}) {
     this.adb = opts.adb
@@ -110,6 +113,23 @@ class AudioRouter {
        * 而用户根本没开。规则是「外放默认静音，手动调高才转发」。
        */
       if (this.pcVolume !== 0 || this.manualOverride) this.onLog('[audio] 耳机在场：投屏音量归零')
+      /**
+       * 刚进入耳机态时把手机音量还回去。
+       *
+       * 上一条会话可能已经把 STREAM_MUSIC 锁在 0（APK 的静音锁），
+       * 这时用户戴上耳机听到的也是静音 —— 用户反馈的正是这个。
+       */
+      if (prev.headset !== true) this.restorePhoneVolume().catch(() => {})
+      /**
+       * 持续抑制。
+       *
+       * 只杀一次不够：音频自愈（AudioHealer）看到「没声音」就会用深链把
+       * APK 重新拉起来，它一跑又把手机静音、又开始往电脑推流。实测就是
+       * 耳机连着的状态下 APK 还活着，用户两头都没声音。
+       *
+       * 所以耳机在场期间每 10 秒查一次，发现 APK 还活着就再停掉（并还音量）。
+       */
+      this._enforceHeadsetSuppression()
       this.pcVolume = 0
       this.manualOverride = false
       this.last.pcVolume = 0
@@ -167,18 +187,70 @@ class AudioRouter {
    * 耳机插上时用它：APK 会把手机 STREAM_MUSIC 锁在 0，
    * 不 force-stop 的话耳机里也没声。
    */
+  /**
+   * 停掉手机端 APK，并**把媒体音量还回去**。
+   *
+   * ── 为什么必须还 ──
+   *
+   * 那个 APK 启动时会把 STREAM_MUSIC 锁到 0（为了不在外放时漏音），
+   * 正常退出时它自己会恢复；但我们是用 `am force-stop` 强杀的，
+   * 它的清理代码根本没机会跑。
+   *
+   * 结果就是用户反馈的那一幕：
+   *   插着蓝牙耳机 → 按规则声音留在手机 → 我们把 APK 杀了
+   *   → 手机音量永远停在 0 → **耳机里也没声**，两头都没声音。
+   * 实测被杀后 dumpsys 显示 Muted:true streamVolume:0，bt_a2dp 那一路也是 0。
+   *
+   * 所以强杀之后必须显式设一次音量。
+   */
   async killApk () {
     /** 没有 adb 通道（纯 WiFi）时做不到，直接跳过 —— 别让 adb 报「no devices」刷屏 */
     if (!this.serial) return
     await this._run(['shell', `am force-stop ${this.apkPackage}`])
-    this.onLog(`[audio] 已停止手机端 ${this.apkPackage}`)
+    await this.restorePhoneVolume()
+    this.onLog(`[audio] 已停止手机端 ${this.apkPackage}，并把媒体音量恢复到 ${RESTORE_VOLUME}`)
   }
 
+  /** 把媒体音量设回一个能听见的值（耳机/外放都适用） */
+  async restorePhoneVolume (level = RESTORE_VOLUME) {
+    if (!this.serial) return
+    await this._run(['shell', `cmd media_session volume --stream 3 --set ${level}`])
+    // 老系统没有 cmd media_session：退回按键
+    const check = await this._run(['shell', 'dumpsys audio | grep -m1 "streamVolume:"'])
+    const m = /streamVolume:(\d+)/.exec(check.out || '')
+    if (!m || Number(m[1]) < 1) {
+      for (let i = 0; i < level; i++) await this._run(['shell', 'input keyevent 24'])
+    }
+  }
+
+
+  /**
+   * 耳机在场期间压住手机端 APK。
+   *
+   * 节流 10 秒：pidof 是一次 adb shell，别每 2 秒打一次。
+   * 发现还活着 → 停掉 + 恢复音量（APK 被强杀不会自己恢复）。
+   */
+  _enforceHeadsetSuppression () {
+    if (!this.serial) return
+    const now = Date.now()
+    if (now - (this._lastApkSweepAt || 0) < 10000) return
+    this._lastApkSweepAt = now
+    ;(async () => {
+      try {
+        const r = await this._run(['shell', `pidof ${this.apkPackage}`])
+        if (!String(r.out || '').trim()) return
+        this.onLog('[audio] 耳机在场但手机端 App 又起来了 → 再停一次')
+        await this.killApk()
+      } catch {}
+    })()
+  }
   /** 规则 6：断开时停音频并杀掉手机端 APK */
   async teardown () {
     this.stop()
+    if (!this.serial) return
     await this._run(['shell', `am force-stop ${this.apkPackage}`])
-    this.onLog(`[audio] 已断开音频并停止手机端 ${this.apkPackage}`)
+    await this.restorePhoneVolume()
+    this.onLog(`[audio] 已断开音频并停止手机端 ${this.apkPackage}（音量已恢复）`)
   }
 
   start (intervalMs = 2000) {
