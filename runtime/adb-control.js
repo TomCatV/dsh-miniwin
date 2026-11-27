@@ -466,10 +466,28 @@ class AdbShellControl {
   }
 
   /** 滚动：用短距离 swipe 模拟 */
+  /**
+   * 滚动：用 swipe 模拟。
+   *
+   * ── 两处改动（原来滚一格永远只走 15% 屏，快滚也慢）──
+   *
+   * ① 距离跟滚轮力度挂钩：vscroll 的绝对值 1..30 映射到 8%~41% 屏高，
+   *    滚得猛就走得远，符合直觉；
+   * ② 时长 150ms → 250ms：太快会被系统当成「甩动」，很多阅读类 App
+   *    直接忽略这种手势，用户的感觉就是「滚了没反应」。
+   *
+   * 方向：滚轮向下（vscroll < 0）→ 手指向上滑 → 内容向下滚。
+   */
   scroll (x, y, hscroll, vscroll) {
     const p = this.toPhysical(x, y)
-    const stepY = Math.round(this.physH * 0.15) * (vscroll > 0 ? 1 : -1)
-    this._cmd(`input swipe ${p.x} ${p.y - stepY / 2} ${p.x} ${p.y + stepY / 2} 150`)
+    const v = Number(vscroll) || 0
+    if (!v && !hscroll) return
+    const mag = Math.min(30, Math.abs(v) || 1)
+    const frac = 0.08 + 0.011 * mag            // 0.09 ~ 0.41 屏高
+    const dist = Math.max(120, Math.round(this.physH * frac))
+    const y1 = Math.round(p.y + (v > 0 ? -dist / 2 : dist / 2))
+    const y2 = Math.round(p.y + (v > 0 ? dist / 2 : -dist / 2))
+    this._cmd(`input swipe ${p.x} ${y1} ${p.x} ${y2} 250`)
   }
 }
 

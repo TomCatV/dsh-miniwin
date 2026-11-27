@@ -3032,9 +3032,11 @@ ipcMain.on('ctl:text', async (_e, text) => {
 })
 
 ipcMain.on('ctl:scroll', async (_e, d) => {
-  if (!d) return
+  if (!d) { logLine('warn', '[ctl] scroll 参数为空'); return }
   const c = await ensureCtrl()
-  if (!c) return
+  if (!c) { logLine('warn', '[ctl] scroll 失败：控制通道未就绪'); return }
+  // 滚轮这条链路以前完全静默，出问题无从查起；补一行日志
+  logLine('info', `[ctl] scroll 视频(${Math.round(d.x || 0)},${Math.round(d.y || 0)}) vy=${d.vy || 0}`)
   c.scroll(d.x, d.y, d.hx || 0, d.vy || 0)
 })
 
