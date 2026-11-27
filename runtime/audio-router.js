@@ -133,6 +133,21 @@ class AudioRouter {
       this.pcVolume = 0
       this.manualOverride = false
       this.last.pcVolume = 0
+    } else if (prev.headset === true) {
+      /**
+       * 耳机刚断开 → 声音自动接到电脑。
+       *
+       * 用户原话：「现在手机端蓝牙断了那么就把声音推到电脑端」。
+       *
+       * 注意这跟「外放连上投屏默认静音」不冲突：那条说的是**建立会话**时
+       * 的初始状态；这里是使用中途耳机被拔掉/蓝牙断开，用户此时显然是想
+       * 继续听（刚才还在用耳机听），所以直接把投屏音量开到手机当前音量
+       * （拿不到就用 RESTORE_VOLUME），而不是停在 0 让他以为坏了。
+       */
+      this.pcVolume = Math.max(1, intentVol || RESTORE_VOLUME)
+      this.manualOverride = true
+      this.last.pcVolume = this.pcVolume
+      this.onLog(`[audio] 耳机已断开 → 声音转到电脑，投屏音量 ${this.pcVolume}/15`)
     } else if (intentVol !== prev.phoneVolume) {
       /**
        * 规则 5：手机端音量变化 → 投屏端直接重置成手机端音量。

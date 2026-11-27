@@ -1744,7 +1744,20 @@ async function startScrcpySession (opts = {}) {
           .catch(() => {})
       } else if (!st.headset && apkSuppressed) {
         apkSuppressed = false
-        logLine('info', '[audio] 耳机已拔出：恢复手机端声音采集')
+        logLine('info', '[audio] 耳机已断开：把声音接到电脑')
+        /**
+         * 三件事，缺一不可：
+         *   ① 重新起音频接收端 —— 耳机在场时整条链路是没启动的
+         *      （见 startScrcpySession 里的 headsetNow 判断），
+         *      所以要现场拉一个跟会话无关的接收端（27190/27191）；
+         *   ② 重启自愈，让它用深链把手机端 App 拉起来推流；
+         *   ③ 音量已经在 AudioRouter 里自动开到手机当前音量了。
+         */
+        ensureFallbackReceiver()
+          .then(port => {
+            if (port) logLine('ok', `[audio] 接收端已就绪（127.0.0.1:${port}），等手机推流`)
+          })
+          .catch(() => {})
         try { if (session.healer) session.healer.start() } catch {}
       }
     }
