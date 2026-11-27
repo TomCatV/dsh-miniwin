@@ -1781,9 +1781,9 @@ async function startScrcpySession (opts = {}) {
       apkSuppressed = true
       await router.killApk()
     } else {
-      // 外放：投屏音量默认 0。手机那头由 APK 自己静音，不用在这里灌音量键。
-      router.setPcVolume(0)
-      logLine('info', '[audio] 外放：投屏音量默认 0，调高才开始把手机声音投到电脑')
+    // 外放：默认就把声音投到电脑（手机端由 APK 自己静音，不会两头响）。
+    router.setPcVolume(8)
+    logLine('info', '[audio] 外放：投屏音量默认 8/15，声音直接投到电脑（手机端静音）')
     }
     router.start()
   } catch (e) {
@@ -3695,13 +3695,13 @@ async function bootWindow () {
           onState: (st) => { try { win && win.webContents.send('audio:state', st) } catch {} }
         })
         await router.poll()
-        router.setPcVolume(0)
+      router.setPcVolume(8)
         router.start()
         app.on('will-quit', () => { try { router.stop() } catch {} })
         logLine(serial ? 'info' : 'warn',
           serial
             ? '[audio] WiFi 模式：音频策略已接管，能识别耳机（' + serial + '）'
-            : '[audio] WiFi 模式：没有 adb 通道，耳机状态无法探测，按外放处理（投屏音量默认 0）')
+      : '[audio] WiFi 模式：没有 adb 通道，耳机状态无法探测，按外放处理（投屏音量默认 8）')
       } catch (e) {
         logLine('warn', '[audio] WiFi 模式音频策略初始化失败: ' + e.message)
       }
